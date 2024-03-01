@@ -2,7 +2,7 @@ import warnings
 from functools import partial
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
-from lhotse import fastcopy
+from lhotse import fastcopy, Features
 from lhotse.array import Array, TemporalArray
 from lhotse.audio import Recording
 from lhotse.cut import Cut
@@ -159,7 +159,7 @@ class SharWriter:
             # Check if the custom attribute is available: if yes
             if cut.has_custom(key):
                 val = getattr(cut, key)
-                if not isinstance(val, (Array, TemporalArray, Recording)):
+                if not isinstance(val, (Array, TemporalArray, Recording, Features)):
                     assert isinstance(
                         self.writers[key], JsonlShardWriter
                     ), f"Expected writer type 'jsonl' (got '{self.fields[key]}') for non-data field '{key}'."

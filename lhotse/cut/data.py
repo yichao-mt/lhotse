@@ -147,7 +147,7 @@ class DataCut(Cut, metaclass=ABCMeta):
         from lhotse.array import Array, TemporalArray
 
         value = self.custom.get(name)
-        if isinstance(value, Array):
+        if isinstance(value, Array) or isinstance(value, Features):
             # Array does not support slicing.
             return value.load()
         elif isinstance(value, TemporalArray):
