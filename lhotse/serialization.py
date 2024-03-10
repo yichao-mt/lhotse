@@ -600,7 +600,12 @@ def deserialize_custom_field(data: Optional[dict]) -> Optional[dict]:
                 data[key] = deserialize_array(value)
             except:
                 pass
-
+        if isinstance(value, list):
+            if value and all(k in value[0] for k in ("id", "sources", "sampling_rate")):
+                new_value = []
+                for v in value:
+                    new_value.append(Recording.from_dict(v))
+                data[key] = new_value
     return data
 
 
