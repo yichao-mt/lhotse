@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from math import ceil, isclose
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -55,13 +55,19 @@ class Recording:
     and a 1-hour session with multiple channels and speakers (e.g., in AMI).
     In the latter case, it is partitioned into data suitable for model training using :class:`~lhotse.cut.Cut`.
 
-    .. hint::
-        Lhotse reads audio recordings using `pysoundfile`_ and `audioread`_, similarly to librosa,
-        to support multiple audio formats. For OPUS files we require ffmpeg to be installed.
+    Internally, Lhotse supports multiple audio backends to read audio file.
+    By default, we try to use libsoundfile, then torchaudio (with FFMPEG integration starting with torchaudio 2.1),
+    and then audioread (which is an ffmpeg CLI wrapper).
+    For sphere files we prefer to use sph2pipe binary as it can work with certain unique encodings such as "shorten".
 
-    .. hint::
-        Since we support importing Kaldi data dirs, if ``wav.scp`` contains unix pipes,
-        :class:`~lhotse.audio.Recording` will also handle them correctly.
+    Audio backends in Lhotse are configurable. See:
+
+    * :func:`~lhotse.audio.backend.available_audio_backends`
+    * :func:`~lhotse.audio.backend.audio_backend`,
+    * :func:`~lhotse.audio.backend.get_current_audio_backend`
+    * :func:`~lhotse.audio.backend.set_current_audio_backend`
+    * :func:`~lhotse.audio.backend.get_default_audio_backend`
+
 
     Examples
 
@@ -110,6 +116,8 @@ class Recording:
             >>> assert samples.shape == (1, 16000)
             >>> samples2 = recording.load_audio(offset=0.5)
             >>> assert samples2.shape == (1, 8000)
+
+        See also: :class:`~lhotse.audio.recording.Recording`, :class:`~lhotse.cut.Cut`, :class:`~lhotse.cut.CutSet`.
     """
 
     id: str
@@ -118,7 +126,7 @@ class Recording:
     num_samples: int
     duration: Seconds
     channel_ids: Optional[List[int]] = None
-    transforms: Optional[List[Dict]] = None
+    transforms: Optional[List[Union[AudioTransform, Dict]]] = None
 
     def __post_init__(self):
         if self.channel_ids is None:
@@ -326,7 +334,10 @@ class Recording:
         )
 
     def to_dict(self) -> dict:
-        return asdict_nonull(self)
+        d = asdict_nonull(self)
+        if self.transforms is not None:
+            d["transforms"] = [t.to_dict() for t in self.transforms]
+        return d
 
     def to_cut(self):
         """
@@ -387,7 +398,8 @@ class Recording:
             )
 
         transforms = [
-            AudioTransform.from_dict(params) for params in self.transforms or []
+            tnfm if isinstance(tnfm, AudioTransform) else AudioTransform.from_dict(tnfm)
+            for tnfm in self.transforms or []
         ]
 
         # Do a "backward pass" over data augmentation transforms to get the
@@ -480,10 +492,15 @@ class Recording:
         )
 
         for t in ifnone(self.transforms, ()):
-            assert t["name"] not in (
-                "Speed",
-                "Tempo",
-            ), "Recording.load_video() does not support speed/tempo perturbation."
+            if isinstance(t, dict):
+                assert t["name"] not in (
+                    "Speed",
+                    "Tempo",
+                ), "Recording.load_video() does not support speed/tempo perturbation."
+            else:
+                assert not isinstance(
+                    t, (Speed, Tempo)
+                ), "Recording.load_video() does not support speed/tempo perturbation."
 
         if not with_audio:
             video, _ = self._video_source.load_video(
@@ -511,7 +528,8 @@ class Recording:
             )
 
         transforms = [
-            AudioTransform.from_dict(params) for params in self.transforms or []
+            tnfm if isinstance(tnfm, AudioTransform) else AudioTransform.from_dict(tnfm)
+            for tnfm in self.transforms or []
         ]
 
         # Do a "backward pass" over data augmentation transforms to get the
@@ -651,7 +669,7 @@ class Recording:
         :return: a modified copy of the current ``Recording``.
         """
         transforms = self.transforms.copy() if self.transforms is not None else []
-        transforms.append(Speed(factor=factor).to_dict())
+        transforms.append(Speed(factor=factor))
         new_num_samples = perturb_num_samples(self.num_samples, factor)
         new_duration = new_num_samples / self.sampling_rate
         return fastcopy(
@@ -676,7 +694,7 @@ class Recording:
         :return: a modified copy of the current ``Recording``.
         """
         transforms = self.transforms.copy() if self.transforms is not None else []
-        transforms.append(Tempo(factor=factor).to_dict())
+        transforms.append(Tempo(factor=factor))
         new_num_samples = perturb_num_samples(self.num_samples, factor)
         new_duration = new_num_samples / self.sampling_rate
         return fastcopy(
@@ -697,7 +715,7 @@ class Recording:
         :return: a modified copy of the current ``Recording``.
         """
         transforms = self.transforms.copy() if self.transforms is not None else []
-        transforms.append(Volume(factor=factor).to_dict())
+        transforms.append(Volume(factor=factor))
         return fastcopy(
             self,
             id=f"{self.id}_vp{factor}" if affix_id else self.id,
@@ -714,7 +732,7 @@ class Recording:
         :return: a modified copy of the current ``Recording``.
         """
         transforms = self.transforms.copy() if self.transforms is not None else []
-        transforms.append(LoudnessNormalization(target=target).to_dict())
+        transforms.append(LoudnessNormalization(target=target))
         return fastcopy(
             self,
             id=f"{self.id}_ln{target}" if affix_id else self.id,
@@ -730,7 +748,7 @@ class Recording:
         :return: a modified copy of the current ``Recording``.
         """
         transforms = self.transforms.copy() if self.transforms is not None else []
-        transforms.append(DereverbWPE().to_dict())
+        transforms.append(DereverbWPE())
         return fastcopy(
             self,
             id=f"{self.id}_wpe" if affix_id else self.id,
@@ -743,7 +761,7 @@ class Recording:
         normalize_output: bool = True,
         early_only: bool = False,
         affix_id: bool = True,
-        rir_channels: Optional[List[int]] = None,
+        rir_channels: Optional[Sequence[int]] = None,
         room_rng_seed: Optional[int] = None,
         source_rng_seed: Optional[int] = None,
     ) -> "Recording":
@@ -804,7 +822,7 @@ class Recording:
                 early_only=early_only,
                 rir_channels=rir_channels if rir_channels is not None else [0],
                 rir_generator=rir_generator,
-            ).to_dict()
+            )
         )
         return fastcopy(
             self,
@@ -827,7 +845,7 @@ class Recording:
             Resample(
                 source_sampling_rate=self.sampling_rate,
                 target_sampling_rate=sampling_rate,
-            ).to_dict()
+            )
         )
 
         new_num_samples = compute_num_samples(

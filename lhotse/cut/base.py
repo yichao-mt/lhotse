@@ -22,7 +22,6 @@ from lhotse.utils import (
     compute_start_duration_for_extended_cut,
     fastcopy,
     ifnone,
-    is_torchaudio_available,
     overlaps,
     to_hashable,
 )
@@ -677,7 +676,7 @@ class Cut:
         from .set import CutSet
 
         if not self.supervisions:
-            return self
+            return CutSet([self])
         supervisions = sorted(self.supervisions, key=lambda s: s.start)
         supervision_group = [supervisions[0]]
         cur_end = supervisions[0].end
