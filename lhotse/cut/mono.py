@@ -389,3 +389,13 @@ class MonoCut(DataCut):
             recording=recording,
             supervisions=[SupervisionSegment.from_dict(s) for s in supervision_infos],
         )
+
+    def __lt__(self, other):
+        token_length = len(self.supervisions[0].custom['tokens']['text'])
+        other_token_length = len(other.supervisions[0].custom['tokens']['text'])
+        if token_length - other_token_length >= 3:
+            return True
+        elif token_length - other_token_length <= -3:
+            return False
+        else:
+            return self.duration > other.duration
