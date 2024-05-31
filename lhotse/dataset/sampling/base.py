@@ -437,6 +437,7 @@ class TimeConstraint(SamplingConstraint):
     current: Union[int, Seconds] = 0
     num_cuts: int = 0
     longest_seen: Union[int, float] = 0
+    longest_seen_text: Union[int, float] = 0
     quadratic_duration: Optional[Seconds] = None
 
     def __post_init__(self) -> None:
@@ -454,18 +455,23 @@ class TimeConstraint(SamplingConstraint):
         selecting the right property from the input ``cut`` object.
         """
         if self.max_duration is not None:
-            duration = self._maybe_apply_quadratic_correction(example.duration)
-            self.current += duration
+            duration = self._maybe_apply_quadratic_correction(example.duration, quadratic_expand_value=1.5)
+            try:
+                text_duration = self._maybe_apply_quadratic_correction(len(example.supervisions[0].custom['tokens']['text']) * 0.046)
+            except:
+                text_duration = 0
+            self.current += duration + text_duration
             self.longest_seen = max(self.longest_seen, duration)
+            self.longest_seen_text = max(self.longest_seen_text, text_duration)
         self.num_cuts += 1
 
-    def _maybe_apply_quadratic_correction(self, duration: Seconds) -> Seconds:
+    def _maybe_apply_quadratic_correction(self, duration: Seconds, quadratic_expand_value: Seconds = 1.0) -> Seconds:
         if self.quadratic_duration is None:
             return duration
         # For the quadratic complexity case, we add a term that accounts for
         # extra memory occupied by the model. The 1/quadratic_duration term causes
         # the effective duration to be doubled when it's equal to quadratic_duration.
-        return duration + (duration**2) / self.quadratic_duration
+        return duration + ((duration * quadratic_expand_value)**2) / self.quadratic_duration
 
     def exceeded(self) -> bool:
         """Is the constraint exceeded or not."""
@@ -473,7 +479,7 @@ class TimeConstraint(SamplingConstraint):
             return True
         if self.max_duration is None:
             return False
-        effective_duration = self.num_cuts * self.longest_seen
+        effective_duration = self.num_cuts * (self.longest_seen + self.longest_seen_text)
         return effective_duration > self.max_duration
 
     def close_to_exceeding(self) -> bool:
@@ -487,7 +493,7 @@ class TimeConstraint(SamplingConstraint):
             return True
 
         if self.max_duration is not None:
-            effective_duration = (self.num_cuts + 1) * self.longest_seen
+            effective_duration = (self.num_cuts + 1) * (self.longest_seen + self.longest_seen_text)
             return effective_duration > self.max_duration
         return False
 
@@ -499,6 +505,7 @@ class TimeConstraint(SamplingConstraint):
         self.current = 0
         self.num_cuts = 0
         self.longest_seen = 0
+        self.longest_seen_text = 0
 
     def measure_length(self, example: Cut) -> float:
         return example.duration
@@ -512,6 +519,7 @@ class TimeConstraint(SamplingConstraint):
         self.current = state_dict.pop("current")
         self.num_cuts = state_dict.pop("num_cuts")
         self.longest_seen = state_dict.pop("longest_seen", 0)
+        self.longest_seen_text = state_dict.pop("longest_seen_text", 0)
         self.quadratic_duration = state_dict.pop("quadratic_duration", None)
         # backward compatibility
         state_dict.pop("strict", None)
@@ -537,6 +545,7 @@ class TimeConstraint(SamplingConstraint):
             current=self.current + other.current,
             num_cuts=self.num_cuts + other.num_cuts,
             longest_seen=max(self.longest_seen, other.longest_seen),
+            longest_seen_text=max(self.longest_seen_text, other.longest_seen_text),
             quadratic_duration=self.quadratic_duration,
         )
 
