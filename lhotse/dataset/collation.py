@@ -199,7 +199,15 @@ def collate_audio(
         cuts, executor, suppress_errors=fault_tolerant, recording_field=recording_field
     )
 
-    audios = torch.stack(audios)
+    try:
+        audios = torch.stack(audios)
+    except RuntimeError:
+        # 找到最长的音频长度
+        max_length = max(audio.size(0) for audio in audios)
+        # 对每个音频进行填充
+        padded_audios = [torch.nn.functional.pad(audio, (0, max_length - audio.size(0))) for audio in audios]
+        audios = torch.stack(padded_audios)
+
     audio_lens = torch.tensor(
         [cut_id2num_samples[cut.id] for cut in cuts], dtype=torch.int32
     )
