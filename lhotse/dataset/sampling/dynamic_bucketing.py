@@ -18,6 +18,7 @@ from typing import (
     Tuple,
     Union,
 )
+import heapq
 
 import numpy as np
 import torch
@@ -458,8 +459,8 @@ class DynamicBucketer:
                 )
 
         # Init: create empty buckets (note: `num_buckets = len(duration_bins) + 1`).
-        self.buckets: List[Deque[Union[Cut, Tuple[Cut, ...]]]] = [
-            deque() for _ in range(len(duration_bins) + 1)
+        self.buckets: List[List[Union[Cut, Tuple[Cut, ...], Tuple[int, Cut]]]] = [
+            [] for _ in range(len(duration_bins) + 1)
         ]
 
     def __iter__(self) -> Generator[CutSet, None, None]:
@@ -485,6 +486,10 @@ class DynamicBucketer:
                     maybe_shuffled = pick_at_random(
                         maybe_shuffled, rng=self.rng, out_indexes_used=indexes_used
                     )
+                else:
+                    maybe_shuffled = pick_at_min_heap(
+                        maybe_shuffled
+                    )
                 # Sample one batch from that bucket and yield it to the caller.
                 batcher = DurationBatcher(
                     maybe_shuffled,
@@ -504,9 +509,8 @@ class DynamicBucketer:
                     for idx in indexes_used:
                         del sampling_bucket[idx]
                 else:
-                    # No shuffling, remove first N
-                    for _ in range(batch_size):
-                        sampling_bucket.popleft()
+                    # already pop by heappop
+                    pass
                 # Fetch new cuts and add them to appropriate buckets.
                 self._collect_cuts_in_buckets(batch_size)
         except StopIteration:
@@ -609,7 +613,7 @@ class DynamicBucketer:
                     cuts[0] if isinstance(cuts, tuple) else cuts
                 )
                 bucket_idx = bisect_right(self.duration_bins, duration)
-                self.buckets[bucket_idx].append(cuts)
+                heapq.heappush(self.buckets[bucket_idx], cuts)
         except StopIteration:
             pass
 
@@ -628,6 +632,12 @@ def pick_at_random(
     for idx in indexes:
         out_indexes_used.append(idx)
         yield bucket[idx]
+
+def pick_at_min_heap(
+    bucket: Sequence[Union[Cut, Tuple[Cut, ...]]],
+) -> Generator[Union[Cut, Tuple[Cut, ...]], None, None]:
+    while bucket:
+        yield heapq.heappop(bucket)
 
 
 class BucketsDontHaveEnoughData(Exception):
