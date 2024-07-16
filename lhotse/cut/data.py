@@ -934,11 +934,11 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
             self.has_recording
         ), "Cannot apply loudness normalization on a DataCut without Recording."
         if self.has_features:
-            logging.warning(
-                "Attempting to normalize loudness on a DataCut that references pre-computed features. "
-                "The feature manifest will be detached, as we do not support feature-domain "
-                "loudness normalization."
-            )
+            # logging.warning(
+            #     "Attempting to normalize loudness on a DataCut that references pre-computed features. "
+            #     "The feature manifest will be detached, as we do not support feature-domain "
+            #     "loudness normalization."
+            # )
             self.features = None
 
         # Add loudness normalization to the recording.
