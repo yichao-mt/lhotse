@@ -239,7 +239,7 @@ class LazySharIterator(Dillable):
             map_fns = self._maybe_shuffle_shards(map_fns)
             map_fns = self._maybe_split_for_dataloading(map_fns)
 
-        for shard, cut_map_fn in zip(shards, map_fns):
+        for shard_idx, (shard, cut_map_fn) in enumerate(zip(shards, map_fns)):
             # Iterate over cuts for the current shard
             cuts = LazyManifestIterator(shard["cuts"])
 
@@ -266,14 +266,28 @@ class LazySharIterator(Dillable):
             # }
 
             # *field_data contains all fields for a single cut (recording, features, array, etc.)
-            for cut in self.generate_shard_cuts(cuts, field_iters):
-                cut.shard_origin = shard["cuts"]
-                cut.shar_epoch = self.epoch
-                if cut_map_fn is not None:
-                    cut = cut_map_fn(cut)
-                yield cut
+            try:
+                for cut in self.generate_shard_cuts(cuts, field_iters):
+                    cut.shard_origin = shard["cuts"]
+                    cut.shar_epoch = self.epoch
+                    if cut_map_fn is not None:
+                        cut = cut_map_fn(cut)
+                    yield cut
+            except OSError as e:
+                print("WARNING(LazySharIterator): OSError: {}".format(e))
+            if shard_idx % 100 == 0:
+                print("INFO(LazySharIterator): EPOCH({}) Shard {}/{} done".format(self.epoch, shard_idx+1, len(shards)))
+
+        for cut in self.generate_customized_cuts():
+            yield cut
 
         self.epoch += 1
+
+
+    def generate_customized_cuts(self):
+        for cut in []:
+            yield cut
+
 
     def generate_shard_cuts(self, cuts, field_iters):
         for cut, *field_data in zip(cuts, *field_iters.values()):
