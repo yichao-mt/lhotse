@@ -56,7 +56,11 @@ def iterate_tarfile_pairwise(
         if len(result) == 2:
             yield tuple(result)
             result = []
-        result.append(parse_tarinfo(tarinfo, tar_file))
+        try:
+            result.append(parse_tarinfo(tarinfo, tar_file))
+        except:
+            print("Failed to parse tar info of tar file {}".format(tar_file))
+            return
 
     if len(result) == 2:
         yield tuple(result)

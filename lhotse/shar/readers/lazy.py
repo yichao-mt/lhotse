@@ -239,7 +239,7 @@ class LazySharIterator(Dillable):
             map_fns = self._maybe_shuffle_shards(map_fns)
             map_fns = self._maybe_split_for_dataloading(map_fns)
 
-        for shard, cut_map_fn in zip(shards, map_fns):
+        for shard_idx, (shard, cut_map_fn) in enumerate(zip(shards, map_fns)):
             # Iterate over cuts for the current shard
             cuts = LazyManifestIterator(shard["cuts"])
 
@@ -249,33 +249,59 @@ class LazySharIterator(Dillable):
             }
 
             # Open every tarfile/jsonl so it's ready for streaming
-            field_iters = {
-                field: TarIterator(path)
-                if extension_contains(".tar", path)
-                else _jsonl_tar_adaptor(LazyJsonlIterator(path), field=field)
-                for field, path in field_paths.items()
-            }
+            field_iters = {}
+            for field, path in field_paths.items():
+                if path is None:
+                    pass
+                elif extension_contains(".tar", path):
+                    field_iters[field] = TarIterator(path)
+                else:
+                    for item, pseudo_path in _jsonl_tar_adaptor(LazyJsonlIterator(path), field=field):
+                        field_iters[field] = TarIterator(pseudo_path)
+            # field_iters = {
+            #     field: TarIterator(path)
+            #     if extension_contains(".tar", path)
+            #     else _jsonl_tar_adaptor(LazyJsonlIterator(path), field=field)
+            #     for field, path in field_paths.items()
+            # }
 
             # *field_data contains all fields for a single cut (recording, features, array, etc.)
-            for cut, *field_data in zip(cuts, *field_iters.values()):
-                for (field, (maybe_manifest, data_path)) in zip(
-                    field_iters.keys(),
-                    field_data,
-                ):
-                    if maybe_manifest is None:
-                        continue  # No value available for the current field for this cut.
-                    assert (
-                        str(data_path.parent / data_path.stem) == cut.id
-                    ), f"Mismatched IDs: cut ID is '{cut.id}' but found data with name '{data_path}' fsor field {field}"
-                    setattr(cut, field, maybe_manifest)
+            try:
+                for cut in self.generate_shard_cuts(cuts, field_iters):
+                    cut.shard_origin = shard["cuts"]
+                    cut.shar_epoch = self.epoch
+                    if cut_map_fn is not None:
+                        cut = cut_map_fn(cut)
+                    yield cut
+            except OSError as e:
+                print("WARNING(LazySharIterator): OSError: {}".format(e))
+            if shard_idx % 100 == 0:
+                print("INFO(LazySharIterator): EPOCH({}) Shard {}/{} done".format(self.epoch, shard_idx+1, len(shards)))
 
-                cut.shard_origin = shard["cuts"]
-                cut.shar_epoch = self.epoch
-                if cut_map_fn is not None:
-                    cut = cut_map_fn(cut)
-                yield cut
+        for cut in self.generate_customized_cuts():
+            yield cut
 
         self.epoch += 1
+
+
+    def generate_customized_cuts(self):
+        for cut in []:
+            yield cut
+
+
+    def generate_shard_cuts(self, cuts, field_iters):
+        for cut, *field_data in zip(cuts, *field_iters.values()):
+            for (field, (maybe_manifest, data_path)) in zip(
+                    field_iters.keys(),
+                    field_data,
+            ):
+                if maybe_manifest is None:
+                    continue  # No value available for the current field for this cut.
+                assert (
+                        str(data_path.parent / data_path.stem) == cut.id
+                ), f"Mismatched IDs: cut ID is '{cut.id}' but found data with name '{data_path}' fsor field {field}"
+                setattr(cut, field, maybe_manifest)
+            yield cut
 
     def __len__(self) -> int:
         if self._len is None:
