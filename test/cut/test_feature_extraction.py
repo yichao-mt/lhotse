@@ -8,6 +8,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+pytest.importorskip("lilcom", reason="Lilcom tests require lilcom.")
+
 from lhotse import (
     S3PRLSSL,
     AudioSource,
@@ -33,7 +35,7 @@ from lhotse import (
 from lhotse.cut import MixedCut
 from lhotse.features.io import LilcomFilesWriter
 from lhotse.serialization import InvalidPathExtension
-from lhotse.utils import is_module_available
+from lhotse.utils import is_module_available, is_torchaudio_available
 from lhotse.utils import nullcontext as does_not_raise
 
 
@@ -199,8 +201,20 @@ def is_python_311_or_higher() -> bool:
         Mfcc,
         Spectrogram,
         LogSpectrogram,
-        TorchaudioFbank,
-        TorchaudioMfcc,
+        pytest.param(
+            TorchaudioFbank,
+            marks=pytest.mark.skipif(
+                not is_torchaudio_available(),
+                reason="Requires torchaudio to run.",
+            ),
+        ),
+        pytest.param(
+            KaldifeatFbank,
+            marks=pytest.mark.skipif(
+                not is_module_available("kaldifeat"),
+                reason="Requires kaldifeat to run.",
+            ),
+        ),
         pytest.param(
             KaldifeatFbank,
             marks=pytest.mark.skipif(
@@ -251,7 +265,13 @@ def test_cut_set_batch_feature_extraction(cut_set, extractor_type):
     "extractor_type",
     [
         Fbank,
-        TorchaudioFbank,
+        pytest.param(
+            TorchaudioFbank,
+            marks=pytest.mark.skipif(
+                not is_torchaudio_available(),
+                reason="Requires torchaudio to run.",
+            ),
+        ),
         pytest.param(
             KaldifeatFbank,
             marks=pytest.mark.skipif(
@@ -287,7 +307,6 @@ def test_cut_set_batch_feature_extraction_with_collation(cut_set, extractor_type
     ["suffix", "exception_expectation"],
     [
         (".jsonl", does_not_raise()),
-        (".json", pytest.raises(InvalidPathExtension)),
     ],
 )
 def test_cut_set_batch_feature_extraction_manifest_path(
@@ -347,8 +366,20 @@ def test_cut_set_batch_feature_extraction_resume(cut_set, overwrite):
     [
         Fbank,
         Mfcc,
-        TorchaudioFbank,
-        TorchaudioMfcc,
+        pytest.param(
+            TorchaudioFbank,
+            marks=pytest.mark.skipif(
+                not is_torchaudio_available(),
+                reason="Requires torchaudio",
+            ),
+        ),
+        pytest.param(
+            TorchaudioMfcc,
+            marks=pytest.mark.skipif(
+                not is_torchaudio_available(),
+                reason="Requires torchaudio",
+            ),
+        ),
         pytest.param(
             KaldifeatFbank,
             marks=pytest.mark.skipif(

@@ -1,4 +1,3 @@
-import math
 import random
 import re
 from collections import Counter
@@ -856,6 +855,27 @@ def test_round_robin_sampler(randomize):
     # ... and so on
 
 
+@pytest.mark.parametrize("num_workers", [0, 1, 2, 3])
+def test_nonrandomized_round_robin_sampler_keeps_round_robin_property_in_iterable_dataset(
+    num_workers,
+):
+    cuts1 = DummyManifest(CutSet, begin_id=0, end_id=100)
+    cuts2 = DummyManifest(CutSet, begin_id=500, end_id=600)
+    cuts3 = DummyManifest(CutSet, begin_id=1000, end_id=1100)
+    sampler = RoundRobinSampler(
+        SimpleCutSampler(cuts1, max_cuts=1, shuffle=False),
+        SimpleCutSampler(cuts2, max_cuts=2, shuffle=False),
+        SimpleCutSampler(cuts3, max_cuts=3, shuffle=False),
+    )
+    dloader = DataLoader(
+        dataset=IterableDatasetWrapper(IdentityDataset(), sampler),
+        batch_size=None,
+        num_workers=num_workers,
+    )
+    lens = [len(b) for idx, b in zip(range(15), dloader)]
+    assert lens == [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]
+
+
 @pytest.mark.parametrize("sampler_cls", [SimpleCutSampler, DynamicCutSampler])
 def test_single_cut_sampler_drop_last(sampler_cls):
     # The dummy cuts have a duration of 1 second each
@@ -1145,18 +1165,42 @@ def test_time_constraint_strictness():
     assert strict.exceeded()  # because longest seen 30s * 4 seen cuts = 120s
 
 
+def test_time_constraint_concatenate_cuts():
+    strict = TimeConstraint(max_duration=100, concatenate_cuts=True)
+    # for `concatenate_cuts=True` the behavior of `exceeded()`
+    # and `close_to_exceeding()` is the same
+
+    cut_durs = [50.0, 30.0, 10.0, 10.0, 20.0]
+    assert sum(cut_durs) == pytest.approx(120.0)
+    cuts = [dummy_cut(idx, duration=cd) for idx, cd in enumerate(cut_durs)]
+
+    strict.add(cuts[0])  # total duration: 50s
+    assert not strict.close_to_exceeding()
+    assert not strict.exceeded()
+
+    strict.add(cuts[1])  # total duration: 80s
+    assert not strict.close_to_exceeding()
+    assert not strict.exceeded()
+
+    strict.add(cuts[2])  # total duration: 90s
+    assert not strict.close_to_exceeding()  # because 90s < max_duration
+    assert not strict.exceeded()
+
+    strict.add(cuts[3])  # total duration: 100s
+    assert not strict.close_to_exceeding()  # 100s is not yet above max_duration
+    assert not strict.exceeded()  # 100s is not yet above max_duration
+
+    strict.add(cuts[4])  # total duration: 120s
+    assert strict.close_to_exceeding()  # because 120s is above max_duration
+    assert strict.exceeded()  # 120s is above max_duration
+
+
 @pytest.mark.parametrize(
     "sampler_fn",
     [
         SimpleCutSampler,
         DynamicCutSampler,
-        pytest.param(
-            partial(BucketingSampler, num_buckets=2),
-            marks=pytest.mark.xfail(
-                reason="BucketingSampler will oversample cuts when world_size>1 and drop_last=False "
-                "more than other samplers due to its implementation."
-            ),
-        ),
+        partial(BucketingSampler, num_buckets=2),
         partial(DynamicBucketingSampler, num_buckets=2),
     ],
 )
@@ -1167,6 +1211,16 @@ def test_time_constraint_strictness():
 def test_sampler_does_not_drop_cuts_with_multiple_ranks(
     sampler_fn, world_size, batch_duration
 ):
+    if (
+        isinstance(sampler_fn, partial)
+        and sampler_fn.func is BucketingSampler
+        and (world_size in {16, 32} or (world_size == 2 and batch_duration in {1, 2}))
+    ):
+        pytest.xfail(
+            "BucketingSampler will oversample cuts when world_size>1 and drop_last=False "
+            "more than other samplers due to its implementation."
+        )
+
     cuts = DummyManifest(CutSet, begin_id=0, end_id=10)
     num_input_cuts = len(cuts)
 
@@ -1232,3 +1286,27 @@ def test_sampler_map():
     b = batches[1]
     assert len(b) == 1
     assert b[0].duration == 5.0
+
+
+def test_sampler_much_less_data_than_ddp_ranks():
+    world_size = 128
+    orig_cut = dummy_cut(0)
+    cuts = CutSet([orig_cut])
+
+    samplers = [
+        DynamicCutSampler(
+            cuts, max_cuts=256, drop_last=False, world_size=world_size, rank=i
+        )
+        for i in range(world_size)
+    ]
+    # None of the ranks drops anything, all of them return the one cut we have.
+    for sampler in samplers:
+        (batch,) = [b for b in sampler]
+        assert len(batch) == 1
+        (sampled_cut,) = batch
+        assert (
+            sampled_cut.id[: len(orig_cut.id)] == orig_cut.id
+        )  # same stem, possibly added '_dupX' suffix
+        # otherwise the cuts are identical
+        sampled_cut.id = orig_cut.id
+        assert sampled_cut == orig_cut

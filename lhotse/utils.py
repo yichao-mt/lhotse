@@ -12,11 +12,12 @@ import urllib
 import uuid
 import warnings
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from decimal import ROUND_HALF_DOWN, ROUND_HALF_UP, Decimal
 from itertools import chain
 from math import ceil, isclose
 from pathlib import Path
+from ssl import SSLContext
 from typing import (
     Any,
     Callable,
@@ -32,7 +33,7 @@ from typing import (
     TypeVar,
     Union,
 )
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import click
 import numpy as np
@@ -281,7 +282,12 @@ def fastcopy(dataclass_obj: T, **kwargs) -> T:
         >>> ts1 = TimeSpan(start=5, end=10)
         >>> ts2 = fastcopy(ts1, end=12)
     """
-    return type(dataclass_obj)(**{**dataclass_obj.__dict__, **kwargs})
+    init_values = {
+        field.name: getattr(dataclass_obj, field.name)
+        for field in fields(dataclass_obj)
+        if field.init
+    }
+    return type(dataclass_obj)(**{**init_values, **kwargs})
 
 
 def split_manifest_lazy(
@@ -468,6 +474,8 @@ def resumable_download(
     force_download: bool = False,
     completed_file_size: Optional[int] = None,
     missing_ok: bool = False,
+    ssl_context: Optional[SSLContext] = None,
+    additional_headers: Optional[Dict[str, str]] = None,
 ) -> None:
     # Check if the file exists and get its size
     file_exists = os.path.exists(filename)
@@ -495,6 +503,9 @@ def resumable_download(
         **ua_headers,
     }
 
+    if additional_headers is not None:
+        headers.update(additional_headers)
+
     # Create a request object with the URL and headers
     req = urllib.request.Request(url, headers=headers)
 
@@ -510,7 +521,7 @@ def resumable_download(
             f.truncate()
 
             # Open the URL and read the contents in chunks
-            with urllib.request.urlopen(rq) as response:
+            with urllib.request.urlopen(rq, context=ssl_context) as response:
                 chunk_size = 1024
                 total_size = int(response.headers.get("content-length", 0)) + size
                 with tqdm(
@@ -1107,6 +1118,10 @@ def is_torchaudio_available() -> bool:
     return is_module_available("torchaudio")
 
 
+def is_torchcodec_available() -> bool:
+    return is_module_available("torchcodec")
+
+
 def build_rng(seed: Union[int, Literal["trng"]]) -> random.Random:
     if seed == "trng":
         return secrets.SystemRandom()
@@ -1114,8 +1129,51 @@ def build_rng(seed: Union[int, Literal["trng"]]) -> random.Random:
         return random.Random(seed)
 
 
+def save_rng_state(rng: Optional[random.Random]) -> Optional[tuple]:
+    """
+    Serialize a ``random.Random`` instance's state for checkpointing.
+
+    Returns ``None`` if *rng* is ``None`` (not yet initialized).
+    The returned value can be stored in JSON (tuples become lists) or
+    pickle (tuples preserved) and later restored with :func:`load_rng_state`.
+    """
+    if rng is None:
+        return None
+    return rng.getstate()
+
+
+def load_rng_state(
+    state, rng: Optional[random.Random] = None
+) -> Optional[random.Random]:
+    """
+    Restore a ``random.Random`` instance from a saved state.
+
+    Handles both tuple (pickle) and list (JSON) formats transparently.
+    If *rng* is provided, restores state in-place and returns it;
+    otherwise creates a new ``random.Random()`` instance.
+    Returns ``None`` if *state* is ``None``.
+    """
+    if state is None:
+        return None
+    if rng is None:
+        rng = random.Random()
+    # Handle JSON-deserialized format (lists instead of tuples)
+    if isinstance(state, list):
+        state = (state[0], tuple(state[1]), state[2])
+    elif isinstance(state, tuple) and isinstance(state[1], list):
+        state = (state[0], tuple(state[1]), state[2])
+    rng.setstate(state)
+    return rng
+
+
 _LHOTSE_DILL_ENABLED = False
 
 
 def is_dill_enabled() -> bool:
     return _LHOTSE_DILL_ENABLED or os.environ["LHOTSE_DILL_ENABLED"]
+
+
+def replace_bucket_with_profile_name(identifier, profile_name):
+    parsed_identifier = urlparse(identifier)
+    updated_identifier = parsed_identifier._replace(netloc=profile_name)
+    return urlunparse(updated_identifier)

@@ -1,17 +1,26 @@
+import os
 import pickle
 from abc import ABCMeta, abstractmethod
+from contextlib import contextmanager
 from functools import lru_cache
 from io import BytesIO
 from math import ceil, floor
 from pathlib import Path
-from typing import List, Optional, Type, Union
+from typing import Generator, List, NamedTuple, Optional, Type, Union
 
-import lilcom
 import numpy as np
 
 from lhotse.array import Array, TemporalArray
 from lhotse.caching import dynamic_lru_cache
-from lhotse.utils import Pathlike, Seconds, SmartOpen, is_module_available, pairwise
+from lhotse.serialization import open_best
+from lhotse.utils import (
+    Pathlike,
+    Seconds,
+    SmartOpen,
+    is_module_available,
+    is_valid_url,
+    pairwise,
+)
 
 
 class FeaturesWriter(metaclass=ABCMeta):
@@ -165,10 +174,115 @@ class FeaturesReader(metaclass=ABCMeta):
 
 READER_BACKENDS = {}
 WRITER_BACKENDS = {}
+LILCOM_STORAGE_BACKENDS = {
+    "chunked_lilcom_hdf5",
+    "lilcom_chunky",
+    "lilcom_files",
+    "lilcom_hdf5",
+    "lilcom_url",
+    "memory_lilcom",
+}
+HDF5_STORAGE_BACKENDS = {
+    "chunked_lilcom_hdf5",
+    "lilcom_hdf5",
+    "numpy_hdf5",
+}
+KALDI_NATIVE_IO_STORAGE_BACKENDS = {
+    "kaldiio",
+}
+
+
+class StorageBackendInfo(NamedTuple):
+    name: str
+    available: bool
+    install_hint: Optional[str] = None
+
+
+def _missing_packages_for_storage_backend(backend: str) -> List[str]:
+    missing_packages = []
+    if backend in HDF5_STORAGE_BACKENDS and not is_module_available("h5py"):
+        missing_packages.append("h5py")
+    if backend in LILCOM_STORAGE_BACKENDS and not is_module_available("lilcom"):
+        missing_packages.append("lilcom")
+    if backend in KALDI_NATIVE_IO_STORAGE_BACKENDS and not is_module_available(
+        "kaldi_native_io"
+    ):
+        missing_packages.append("kaldi_native_io")
+    return missing_packages
 
 
 def available_storage_backends() -> List[str]:
-    return sorted(set(READER_BACKENDS).intersection(WRITER_BACKENDS))
+    """
+    Return the names of all currently available feature/array storage backends.
+
+    The result depends on optional dependencies installed in the environment.
+    To inspect all known backends together with availability status and install
+    hints, call :func:`storage_backend_statuses` or run
+    ``lhotse list-storage-backends``.
+    """
+    return [
+        backend
+        for backend in sorted(set(READER_BACKENDS).intersection(WRITER_BACKENDS))
+        if not _missing_packages_for_storage_backend(backend)
+    ]
+
+
+def storage_backend_statuses() -> List[StorageBackendInfo]:
+    """
+    Return status information for all known feature/array storage backends.
+
+    Unavailable backends include a short install hint when one is known.
+    For a CLI equivalent, run ``lhotse list-storage-backends``.
+    """
+    backends = sorted(set(READER_BACKENDS).intersection(WRITER_BACKENDS))
+    return [
+        StorageBackendInfo(
+            name=backend,
+            available=not missing_packages,
+            install_hint=(
+                None
+                if not missing_packages
+                else f"pip install {' '.join(missing_packages)}"
+            ),
+        )
+        for backend in backends
+        for missing_packages in [_missing_packages_for_storage_backend(backend)]
+    ]
+
+
+def check_lilcom_installed() -> None:
+    if not is_module_available("lilcom"):
+        raise ImportError(
+            "To read and write lilcom-compressed arrays, please 'pip install lilcom' "
+            "or select a numpy-based storage backend."
+        )
+
+
+@lru_cache(maxsize=1)
+def get_lilcom_module():
+    check_lilcom_installed()
+    import lilcom
+
+    return lilcom
+
+
+def default_features_storage_backend_name() -> str:
+    maybe_backend = os.environ.get("LHOTSE_FEATURES_STORAGE_BACKEND")
+    if maybe_backend is not None:
+        available = available_storage_backends()
+        assert maybe_backend in available, (
+            "The default feature storage backend requested via "
+            f"LHOTSE_FEATURES_STORAGE_BACKEND={maybe_backend!r} is unavailable. "
+            f"Available choices: {available}"
+        )
+        return maybe_backend
+    return "numpy_files"
+
+
+def default_features_storage_backend() -> Type["FeaturesWriter"]:
+    writer = get_writer(default_features_storage_backend_name())
+    assert writer is not None
+    return writer
 
 
 def register_reader(cls):
@@ -223,15 +337,76 @@ def get_writer(name: str) -> Type[FeaturesWriter]:
     return WRITER_BACKENDS.get(name)
 
 
+class FileIO:
+    """
+    Helper util for opening a file object for reading or writing in a directory on the local filesystem,
+    or a URL to supported object store (S3, AIStore, etc.).
+    ``storage_path`` corresponds to the directory path or base URL prefix;
+    ``storage_key`` for each utterance is the name of the file in that directory.
+    """
+
+    def __init__(self, storage_path: Pathlike):
+        super().__init__()
+        self.storage_path = str(storage_path)
+        self.is_url = is_valid_url(storage_path)
+        if self.is_url:
+            if self.storage_path.endswith("/"):
+                self.storage_path = self.storage_path[:-1]
+
+    @contextmanager
+    def open_fileobj(
+        self, key: str, mode: str, add_subdir: bool = False
+    ) -> Generator[tuple, None, None]:
+        """
+        Open a file for reading or writing on local disk or URL to object store.
+        Arg "key" should contain the extension for the file.
+        Mode is either "r" or "w".
+        Arg "add_subdir" can be set to True, in which case on the local filesystem it will create
+            an extra subdirectory of ``self.storage_path`` with the first three letters of ``key``,
+            preventing big datasets from exhausting the filesystem with one big directory.
+            This arg is ignored for URLs.
+
+        Yields a tuple of (open_file_object, path_or_url).
+        """
+        assert not (
+            "r" in mode and "w" in mode
+        ), "Opening for both reading and writing is not supported."
+        if "r" in mode:
+            if key.startswith("/") and len(self.storage_path) > 0:
+                key = key[1:]
+            input_path = f"{self.storage_path}/{key}"
+            with open_best(input_path, "rb") as f:
+                yield f, input_path
+        elif "w" in mode:
+            if self.is_url:
+                if key.startswith("/"):
+                    key = key[1:]
+                output_path = f"{self.storage_path}/{key}"
+            else:
+                p = Path(self.storage_path)
+                p.mkdir(exist_ok=True, parents=True)
+                if add_subdir:
+                    subdir = p / key[:3]
+                    subdir.mkdir(exist_ok=True)
+                    output_path = subdir / key
+                else:
+                    output_path = p / key
+            with open_best(output_path, "wb") as f:
+                yield f, output_path
+        else:
+            raise ValueError(f"Unsupported file mode (missing r or w): '{mode}'")
+
+
 """
-Lilcom-compressed numpy arrays, stored in separate files on the filesystem.
+Lilcom-compressed numpy arrays, stored in separate files on the filesystem / object store.
 """
 
 
 @register_reader
 class LilcomFilesReader(FeaturesReader):
     """
-    Reads Lilcom-compressed files from a directory on the local filesystem.
+    Reads Lilcom-compressed files from a directory on the local filesystem,
+    or a URL to supported object store (S3, AIStore, etc.).
     ``storage_path`` corresponds to the directory path;
     ``storage_key`` for each utterance is the name of the file in that directory.
     """
@@ -240,7 +415,8 @@ class LilcomFilesReader(FeaturesReader):
 
     def __init__(self, storage_path: Pathlike, *args, **kwargs):
         super().__init__()
-        self.storage_path = Path(storage_path)
+        check_lilcom_installed()
+        self.io = FileIO(storage_path)
 
     @dynamic_lru_cache
     def read(
@@ -249,15 +425,16 @@ class LilcomFilesReader(FeaturesReader):
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
     ) -> np.ndarray:
-        with open(self.storage_path / key, "rb") as f:
-            arr = lilcom.decompress(f.read())
+        with self.io.open_fileobj(key, mode="r") as (f, input_path):
+            arr = get_lilcom_module().decompress(f.read())
         return arr[left_offset_frames:right_offset_frames]
 
 
 @register_writer
 class LilcomFilesWriter(FeaturesWriter):
     """
-    Writes Lilcom-compressed files to a directory on the local filesystem.
+    Writes Lilcom-compressed files to a directory on the local filesystem,
+    or a URL to supported object store (S3, AIStore, etc.).
     ``storage_path`` corresponds to the directory path;
     ``storage_key`` for each utterance is the name of the file in that directory.
     """
@@ -266,40 +443,37 @@ class LilcomFilesWriter(FeaturesWriter):
 
     def __init__(self, storage_path: Pathlike, tick_power: int = -5, *args, **kwargs):
         super().__init__()
-        self.storage_path_ = Path(storage_path)
-        self.storage_path_.mkdir(parents=True, exist_ok=True)
+        check_lilcom_installed()
+        self.io = FileIO(storage_path)
         self.tick_power = tick_power
 
     @property
     def storage_path(self) -> str:
-        return str(self.storage_path_)
+        return self.io.storage_path
 
     def write(self, key: str, value: np.ndarray) -> str:
-        # Introduce a sub-directory that starts with the first 3 characters of the key, that is typically
-        # an auto-generated hash. This allows to avoid filesystem performance problems related to storing
-        # too many files in a single directory.
-        subdir = self.storage_path_ / key[:3]
-        subdir.mkdir(exist_ok=True)
-        p = subdir / key
-        output_features_path = p.with_suffix(
-            p.suffix + ".llc" if p.suffix != ".llc" else ".llc"
+        if not key.endswith(".llc"):
+            key = key + ".llc"
+        serialized_feats = get_lilcom_module().compress(
+            value, tick_power=self.tick_power
         )
-        serialized_feats = lilcom.compress(value, tick_power=self.tick_power)
-        with open(output_features_path, "wb") as f:
+        with self.io.open_fileobj(key, "w", add_subdir=True) as (f, output_path):
             f.write(serialized_feats)
-        # Include sub-directory in the key, e.g. "abc/abcdef.llc"
-        return "/".join(output_features_path.parts[-2:])
+            if not self.io.is_url:
+                key = "/".join(Path(output_path).parts[-2:])
+        return key
 
 
 """
-Non-compressed numpy arrays, stored in separate files on the filesystem.
+Non-compressed numpy arrays, stored in separate files on the filesystem / object store.
 """
 
 
 @register_reader
 class NumpyFilesReader(FeaturesReader):
     """
-    Reads non-compressed numpy arrays from files in a directory on the local filesystem.
+    Reads non-compressed numpy arrays from files in a directory on the local filesystem,
+    or a URL to supported object store (S3, AIStore, etc.).
     ``storage_path`` corresponds to the directory path;
     ``storage_key`` for each utterance is the name of the file in that directory.
     """
@@ -308,7 +482,7 @@ class NumpyFilesReader(FeaturesReader):
 
     def __init__(self, storage_path: Pathlike, *args, **kwargs):
         super().__init__()
-        self.storage_path = Path(storage_path)
+        self.io = FileIO(storage_path)
 
     @dynamic_lru_cache
     def read(
@@ -317,14 +491,16 @@ class NumpyFilesReader(FeaturesReader):
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
     ) -> np.ndarray:
-        arr = np.load(self.storage_path / key, allow_pickle=False)
+        with self.io.open_fileobj(key, mode="r") as (f, input_path):
+            arr = np.load(f, allow_pickle=False)
         return arr[left_offset_frames:right_offset_frames]
 
 
 @register_writer
 class NumpyFilesWriter(FeaturesWriter):
     """
-    Writes non-compressed numpy arrays to files in a directory on the local filesystem.
+    Writes non-compressed numpy arrays to files in a directory on the local filesystem,
+    or a URL to supported object store (S3, AIStore, etc.).
     ``storage_path`` corresponds to the directory path;
     ``storage_key`` for each utterance is the name of the file in that directory.
     """
@@ -333,26 +509,20 @@ class NumpyFilesWriter(FeaturesWriter):
 
     def __init__(self, storage_path: Pathlike, *args, **kwargs):
         super().__init__()
-        self.storage_path_ = Path(storage_path)
-        self.storage_path_.mkdir(parents=True, exist_ok=True)
+        self.io = FileIO(storage_path)
 
     @property
     def storage_path(self) -> str:
-        return str(self.storage_path_)
+        return self.io.storage_path
 
     def write(self, key: str, value: np.ndarray) -> str:
-        # Introduce a sub-directory that starts with the first 3 characters of the key, that is typically
-        # an auto-generated hash. This allows to avoid filesystem performance problems related to storing
-        # too many files in a single directory.
-        subdir = self.storage_path_ / key[:3]
-        subdir.mkdir(exist_ok=True)
-        p = subdir / key
-        output_features_path = p.with_suffix(
-            p.suffix + ".npy" if p.suffix != ".npy" else ".npy"
-        )
-        np.save(output_features_path, value, allow_pickle=False)
-        # Include sub-directory in the key, e.g. "abc/abcdef.npy"
-        return "/".join(output_features_path.parts[-2:])
+        if not key.endswith(".npy"):
+            key = key + ".npy"
+        with self.io.open_fileobj(key, "w", add_subdir=True) as (f, output_path):
+            np.save(f, value, allow_pickle=False)
+            if not self.io.is_url:
+                key = "/".join(Path(output_path).parts[-2:])
+        return key
 
 
 """
@@ -498,6 +668,7 @@ class LilcomHdf5Reader(FeaturesReader):
 
     def __init__(self, storage_path: Pathlike, *args, **kwargs):
         super().__init__()
+        check_lilcom_installed()
         self.hdf = lookup_cache_or_open(storage_path)
 
     @dynamic_lru_cache
@@ -511,7 +682,7 @@ class LilcomHdf5Reader(FeaturesReader):
         # that got deprecated with the following warning:
         # H5pyDeprecationWarning: dataset.value has been deprecated. Use dataset[()] instead.
         #     arr = lilcom.decompress(self.hdf[key].value.tobytes())
-        arr = lilcom.decompress(self.hdf[key][()].tobytes())
+        arr = get_lilcom_module().decompress(self.hdf[key][()].tobytes())
         return arr[left_offset_frames:right_offset_frames]
 
 
@@ -546,6 +717,7 @@ class LilcomHdf5Writer(FeaturesWriter):
         """
         super().__init__()
         check_h5py_installed()
+        check_lilcom_installed()
         import h5py
 
         p = Path(storage_path)
@@ -560,7 +732,9 @@ class LilcomHdf5Writer(FeaturesWriter):
         return str(self.storage_path_)
 
     def write(self, key: str, value: np.ndarray) -> str:
-        serialized_feats = lilcom.compress(value, tick_power=self.tick_power)
+        serialized_feats = get_lilcom_module().compress(
+            value, tick_power=self.tick_power
+        )
         self.hdf.create_dataset(key, data=np.void(serialized_feats))
         return key
 
@@ -598,6 +772,7 @@ class ChunkedLilcomHdf5Reader(FeaturesReader):
 
     def __init__(self, storage_path: Pathlike, *args, **kwargs):
         super().__init__()
+        check_lilcom_installed()
         self.hdf = lookup_cache_or_open(storage_path)
 
     @dynamic_lru_cache
@@ -616,6 +791,7 @@ class ChunkedLilcomHdf5Reader(FeaturesReader):
             right_chunk_idx = None
 
         # Read, decode, concat
+        lilcom = get_lilcom_module()
         decompressed_chunks = [
             lilcom.decompress(data.tobytes())
             for data in self.hdf[key][left_chunk_idx:right_chunk_idx]
@@ -674,6 +850,7 @@ class ChunkedLilcomHdf5Writer(FeaturesWriter):
         """
         super().__init__()
         check_h5py_installed()
+        check_lilcom_installed()
         import h5py
 
         p = Path(storage_path)
@@ -753,6 +930,7 @@ class LilcomChunkyReader(FeaturesReader):
 
     def __init__(self, storage_path: Pathlike, *args, **kwargs):
         super().__init__()
+        check_lilcom_installed()
         self.storage_path = storage_path
 
     @dynamic_lru_cache
@@ -781,6 +959,7 @@ class LilcomChunkyReader(FeaturesReader):
                 chunk_data.append(file.read(end - offset))
 
         # Read, decode, concat
+        lilcom = get_lilcom_module()
         decompressed_chunks = [lilcom.decompress(data) for data in chunk_data]
         if decompressed_chunks:
             arr = np.concatenate(decompressed_chunks, axis=0)
@@ -835,6 +1014,7 @@ class LilcomChunkyWriter(FeaturesWriter):
         :param mode: Modes, one of: "w" (write) or "a" (append); can be "wb" and "ab", "b" is implicit
         """
         super().__init__()
+        check_lilcom_installed()
 
         if "b" not in mode:
             mode = mode + "b"
@@ -899,12 +1079,10 @@ class LilcomURLReader(FeaturesReader):
 
     name = "lilcom_url"
 
-    def __init__(self, storage_path: Pathlike, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        self.base_url = str(storage_path)
-        # We are manually adding the slash to join the base URL and the key.
-        if self.base_url.endswith("/"):
-            self.base_url = self.base_url[:-1]
+        check_lilcom_installed()
+        self._inner = LilcomFilesReader(*args, **kwargs)
 
     @dynamic_lru_cache
     def read(
@@ -913,12 +1091,7 @@ class LilcomURLReader(FeaturesReader):
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
     ) -> np.ndarray:
-        # We are manually adding the slash to join the base URL and the key.
-        if key.startswith("/"):
-            key = key[1:]
-        with SmartOpen.open(f"{self.base_url}/{key}", "rb") as f:
-            arr = lilcom.decompress(f.read())
-        return arr[left_offset_frames:right_offset_frames]
+        return self._inner.read(key, left_offset_frames, right_offset_frames)
 
 
 @register_writer
@@ -934,30 +1107,17 @@ class LilcomURLWriter(FeaturesWriter):
 
     name = "lilcom_url"
 
-    def __init__(self, storage_path: Pathlike, tick_power: int = -5, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        self.base_url = str(storage_path)
-        # We are manually adding the slash to join the base URL and the key.
-        if self.base_url.endswith("/"):
-            self.base_url = self.base_url[:-1]
-        self.tick_power = tick_power
+        check_lilcom_installed()
+        self._inner = LilcomFilesWriter(*args, **kwargs)
 
     @property
     def storage_path(self) -> str:
-        return self.base_url
+        return self._inner.storage_path
 
     def write(self, key: str, value: np.ndarray) -> str:
-        # We are manually adding the slash to join the base URL and the key.
-        if key.startswith("/"):
-            key = key[1:]
-        # Add lilcom extension.
-        if not key.endswith(".llc"):
-            key = key + ".llc"
-        output_features_url = f"{self.base_url}/{key}"
-        serialized_feats = lilcom.compress(value, tick_power=self.tick_power)
-        with SmartOpen.open(output_features_url, "wb") as f:
-            f.write(serialized_feats)
-        return key
+        return self._inner.write(key, value)
 
 
 """
@@ -1124,7 +1284,7 @@ class MemoryLilcomReader(FeaturesReader):
     name = "memory_lilcom"
 
     def __init__(self, *args, **kwargs):
-        pass
+        check_lilcom_installed()
 
     @dynamic_lru_cache
     def read(
@@ -1133,7 +1293,7 @@ class MemoryLilcomReader(FeaturesReader):
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
     ) -> np.ndarray:
-        arr = lilcom.decompress(raw_data)
+        arr = get_lilcom_module().decompress(raw_data)
         return arr[left_offset_frames:right_offset_frames]
 
 
@@ -1149,6 +1309,7 @@ class MemoryLilcomWriter(FeaturesWriter):
         lilcom_tick_power: int = -5,
         **kwargs,
     ) -> None:
+        check_lilcom_installed()
         self.lilcom_tick_power = lilcom_tick_power
 
     @property
@@ -1159,7 +1320,7 @@ class MemoryLilcomWriter(FeaturesWriter):
         assert np.issubdtype(
             value.dtype, np.floating
         ), "Lilcom compression supports only floating-point arrays."
-        return lilcom.compress(value, tick_power=self.lilcom_tick_power)
+        return get_lilcom_module().compress(value, tick_power=self.lilcom_tick_power)
 
     def close(self) -> None:
         pass
@@ -1236,6 +1397,39 @@ class MemoryNpyReader(FeaturesReader):
         stream = BytesIO(raw_data)
         arr = np.load(stream)
         return arr[left_offset_frames:right_offset_frames]
+
+
+@register_reader
+class SharPtrArrayReader(FeaturesReader):
+    """
+    Reads ``Array``/``Features`` payloads referenced via a Shar lazy pointer
+    (``<tar_path>?o=<offset>&e=<end_offset>``). The ``key`` is the pointer
+    string. The format (numpy NPY vs lilcom) is dispatched from the payload's
+    magic bytes — no per-shard format hint required.
+    """
+
+    name = "shar_ptr_array"
+
+    def __init__(self, *args, **kwargs):
+        # Lazy-instantiated; we delegate decode to the memory readers below.
+        self._npy = MemoryNpyReader()
+
+    def read(
+        self,
+        key: str,
+        left_offset_frames: int = 0,
+        right_offset_frames: Optional[int] = None,
+    ) -> np.ndarray:
+        from lhotse.shar.lazy_pointer import read_payload
+
+        raw = read_payload(key)
+        # Dispatch by magic bytes; reuse existing in-memory readers.
+        delegate = self._npy if raw[:6] == b"\x93NUMPY" else MemoryLilcomReader()
+        return delegate.read(
+            raw,
+            left_offset_frames=left_offset_frames,
+            right_offset_frames=right_offset_frames,
+        )
 
 
 @register_reader

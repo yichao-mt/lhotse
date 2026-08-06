@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import torch
+import torch.nn.functional as F
 
 from lhotse import CutSet, FeatureExtractor
 from lhotse.cut import compute_supervisions_frame_mask
@@ -111,7 +112,11 @@ class PrecomputedFeatures(BatchIO):
     .. automethod:: __call__
     """
 
-    def __call__(self, cuts: CutSet) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self,
+        cuts: CutSet,
+        pad_direction: Optional[str] = "right",
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Reads the pre-computed features from disk/other storage.
         The returned shape is ``(B, T, F) => (batch_size, num_frames, num_features)``.
@@ -119,10 +124,15 @@ class PrecomputedFeatures(BatchIO):
         :return: a tensor with collated features, and a tensor of ``num_frames`` of each cut before padding."""
         return collate_features(
             cuts,
+            pad_direction=pad_direction,
             executor=_get_executor(self.num_workers, executor_type=self._executor_type),
         )
 
-    def supervision_intervals(self, cuts: CutSet) -> Dict[str, torch.Tensor]:
+    def supervision_intervals(
+        self,
+        cuts: CutSet,
+        pad_direction: Optional[str] = "right",
+    ) -> Dict[str, torch.Tensor]:
         """
         Returns a dict that specifies the start and end bounds for each supervision,
         as a 1-D int tensor, in terms of frames:
@@ -139,6 +149,13 @@ class PrecomputedFeatures(BatchIO):
         Note that ``S`` might be different than the number of cuts (``B``).
         ``sequence_idx`` means the index of the corresponding feature matrix (or cut) in a batch.
         """
+        if pad_direction not in ("left", "right"):
+            raise ValueError(
+                f"pad_direction must be 'left' or 'right', got {pad_direction}"
+            )
+
+        max_frames = max(cut.num_frames for cut in cuts)
+
         start_frames, nums_frames = zip(
             *(
                 supervision_to_frames(
@@ -148,7 +165,15 @@ class PrecomputedFeatures(BatchIO):
                 for sup in cut.supervisions
             )
         )
-        sequence_idx = [i for i, c in enumerate(cuts) for s in c.supervisions]
+
+        if pad_direction == "left":
+            offsets = [
+                max_frames - cut.num_frames for cut in cuts for _ in cut.supervisions
+            ]
+            start_frames = [s + o for s, o in zip(start_frames, offsets)]
+
+        sequence_idx = [i for i, c in enumerate(cuts) for _ in c.supervisions]
+
         return {
             "sequence_idx": torch.tensor(sequence_idx, dtype=torch.int32),
             "start_frame": torch.tensor(start_frames, dtype=torch.int32),
@@ -156,21 +181,28 @@ class PrecomputedFeatures(BatchIO):
         }
 
     def supervision_masks(
-        self, cuts: CutSet, use_alignment_if_exists: Optional[str] = None
+        self,
+        cuts: CutSet,
+        use_alignment_if_exists: Optional[str] = None,
+        pad_direction: Optional[str] = "right",
     ) -> torch.Tensor:
         """Returns the mask for supervised frames.
 
         :param use_alignment_if_exists: optional str, key for alignment type to use for generating the mask. If not
             exists, fall back on supervision time spans.
+        :param pad_direction: where to apply the padding (``right`` or ``left``).
         """
-        return collate_vectors(
-            [
-                cut.supervisions_feature_mask(
-                    use_alignment_if_exists=use_alignment_if_exists
-                )
-                for cut in cuts
-            ]
-        )
+        if pad_direction not in ("left", "right"):
+            raise ValueError(
+                f"pad_direction must be 'left' or 'right', got {pad_direction}"
+            )
+        masks = [
+            cut.supervisions_feature_mask(
+                use_alignment_if_exists=use_alignment_if_exists
+            )
+            for cut in cuts
+        ]
+        return collate_vectors(masks, pad_direction=pad_direction)
 
 
 class AudioSamples(BatchIO):
@@ -190,6 +222,9 @@ class AudioSamples(BatchIO):
         num_workers: int = 0,
         fault_tolerant: bool = False,
         executor_type: Type[ExecutorType] = ThreadPoolExecutor,
+        use_batch_loader: bool = False,
+        ais_force_individual: bool = False,
+        mono_downmix: Optional[bool] = None,
     ) -> None:
         """
         AudioSamples constructor.
@@ -201,12 +236,37 @@ class AudioSamples(BatchIO):
         :param fault_tolerant: when ``True``, the cuts for which audio loading failed
             will be skipped. It will make ``__call__`` return an additional item,
             which is the CutSet for which we successfully read the audio.
-            It may be a subset of the input CutSet.
+            It may be a subset of the input CutSet. When ``use_batch_loader=True``,
+            this also propagates to :class:`~lhotse.ais.AISBatchLoader` so per-object
+            AIS fetch failures (404, refused, etc.) drop the corresponding cut
+            instead of raising.
         :param executor_type: the type of executor used for parallel audio reads
             (only relevant when ``num_workers>0``).
+        :param use_batch_loader: When ``True``, enables batch loading of audio data from AIStore.
+            This allows all audio samples in the batch to be fetched in a single request for increased efficiency.
+            Requires the input CutSet to be eager (not lazy).
+        :param ais_force_individual: only meaningful when ``use_batch_loader=True``. When
+            ``True``, the underlying :class:`~lhotse.ais.AISBatchLoader` skips the MOSS
+            GetBatch attempt and issues one ``Object.get_reader().read_all()`` per object
+            instead — useful when the AIStore deployment doesn't support GetBatch or its
+            performance is degraded for the access pattern.
+        :param mono_downmix: controls channel handling (passed to :func:`collate_audio`).
+            ``None`` (default): auto-detect — downmix unless every cut is multichannel.
+            ``True``: always downmix to mono; output shape is ``(B, T)``.
+            ``False``: expand mono to channel 0 with zero-padded channels; output shape is ``(B, C, T)``.
         """
         super().__init__(num_workers=num_workers, executor_type=executor_type)
         self.fault_tolerant = fault_tolerant
+        self.mono_downmix = mono_downmix
+        self.ais_batch_loader = None
+        self.use_batch_loader = use_batch_loader
+        if self.use_batch_loader:
+            from lhotse.ais import AISBatchLoader
+
+            self.ais_batch_loader = AISBatchLoader(
+                force_individual=ais_force_individual,
+                skip_failed_fetches=fault_tolerant,
+            )
 
     def __call__(
         self, cuts: CutSet, recording_field: Optional[str] = None
@@ -217,15 +277,25 @@ class AudioSamples(BatchIO):
         Reads the audio samples from recordings on disk/other storage.
         The returned shape is ``(B, T) => (batch_size, num_samples)``.
 
-        :return: a tensor with collated audio samples, and a tensor of ``num_samples`` of each cut before padding.
         :param recording_field: when specified, we will try to load recordings from a custom field with this name
             (i.e., ``cut.load_<recording_field>()`` instead of default ``cut.load_audio()``).
+        :return: a tensor with collated audio samples, and a tensor of ``num_samples`` of each cut before padding.
+
+        .. note::
+            When AIStore batch loading is enabled (`use_batch_loader=True`), the audio data
+            will be fetched from AIStore using a single batch request before collation.
+            The input CutSet must be eager (not lazy).
         """
+        # If AIStore batch loading is enabled, fetch all data in one batch request
+        if self.use_batch_loader and self.ais_batch_loader is not None:
+            # Load all data from AIStore in a single batch request
+            cuts = self.ais_batch_loader(cuts)
         return collate_audio(
             cuts,
             executor=_get_executor(self.num_workers, executor_type=self._executor_type),
             fault_tolerant=self.fault_tolerant,
             recording_field=recording_field,
+            mono_downmix=self.mono_downmix,
         )
 
     def supervision_intervals(self, cuts: CutSet) -> Dict[str, torch.Tensor]:

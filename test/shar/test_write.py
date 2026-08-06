@@ -10,6 +10,7 @@ from lhotse.audio.backend import audio_backend, check_torchaudio_version_gt
 from lhotse.lazy import LazyJsonlIterator
 from lhotse.shar import AudioTarWriter, SharWriter, TarIterator, TarWriter
 from lhotse.testing.dummies import DummyManifest, dummy_cut
+from lhotse.utils import is_torchaudio_available
 
 
 def test_tar_writer(tmp_path: Path):
@@ -19,6 +20,19 @@ def test_tar_writer(tmp_path: Path):
     assert writer.output_paths == [str(tmp_path / "test.000000.tar")]
 
     with tarfile.open(tmp_path / "test.000000.tar") as f:
+        f2 = f.extractfile(f.getmember("test.txt"))
+        assert f2.read() == b"test"
+
+
+def test_tar_writer_with_offset(tmp_path: Path):
+    with TarWriter(
+        str(tmp_path / "test.%06d.tar"), shard_size=10, shard_offset=17
+    ) as writer:
+        writer.write("test.txt", BytesIO(b"test"))
+
+    assert writer.output_paths == [str(tmp_path / "test.000017.tar")]
+
+    with tarfile.open(tmp_path / "test.000017.tar") as f:
         f2 = f.extractfile(f.getmember("test.txt"))
         assert f2.read() == b"test"
 
@@ -67,60 +81,18 @@ def test_tar_writer_pipe(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
-    "format",
-    [
-        "wav",
-        pytest.param(
-            "flac",
-            marks=pytest.mark.skipif(
-                not check_torchaudio_version_gt("0.12.1"),
-                reason="Torchaudio v0.12.1 or greater is required.",
-            ),
-        ),
-        # "mp3",  # apparently doesn't work in CI, mp3 encoder is missing
-        pytest.param(
-            "opus",
-            marks=pytest.mark.skipif(
-                not check_torchaudio_version_gt("2.1.0"),
-                reason="Torchaudio v2.1.0 or greater is required.",
-            ),
-        ),
-    ],
-)
-def test_audio_tar_writer(tmp_path: Path, format: str):
-    from lhotse.testing.dummies import dummy_recording
-
-    recording = dummy_recording(0, with_data=True)
-    audio = recording.load_audio()
-
-    with AudioTarWriter(
-        str(tmp_path / "test.tar"), shard_size=None, format=format
-    ) as writer:
-        writer.write(
-            key="my-recording",
-            value=audio,
-            sampling_rate=recording.sampling_rate,
-            manifest=recording,
-        )
-
-    (path,) = writer.output_paths
-
-    ((deserialized_recording, inner_path),) = list(TarIterator(path))
-
-    deserialized_audio = deserialized_recording.resample(
-        recording.sampling_rate
-    ).load_audio()
-
-    rmse = np.sqrt(np.mean((audio - deserialized_audio) ** 2))
-    assert rmse < 0.5
-
-
-@pytest.mark.parametrize(
     ["format", "backend"],
     [
         ("flac", "default"),
         ("flac", "LibsndfileBackend"),
-        ("flac", "TorchaudioDefaultBackend"),
+        pytest.param(
+            "flac",
+            "TorchaudioDefaultBackend",
+            marks=pytest.mark.skipif(
+                not is_torchaudio_available(),
+                reason="Requires torchaudio",
+            ),
+        ),
         pytest.param(
             "flac",
             "TorchaudioFFMPEGBackend",
@@ -175,7 +147,61 @@ def test_audio_tar_writer(tmp_path: Path, format: str, backend: str):
     assert rmse < 0.5
 
 
-def test_shar_writer(tmp_path: Path):
+@pytest.mark.parametrize(
+    ["original_format", "rmse_threshold"],
+    [("wav", 0.0), ("flac", 0.0), ("mp3", 0.003), ("opus", 0.3)],
+)
+def test_audio_tar_writer_original_format(
+    tmp_path: Path, original_format: str, rmse_threshold: float
+):
+    """Test using AudioTarWritter to write the audio signal in the exact same format
+    as it was loaded from the source.
+    """
+    from lhotse.testing.dummies import dummy_recording
+
+    backend = "default"  # use the default backend for reading the audio
+    writer_format = "original"  # write the audio in the same format as it was loaded
+
+    recording = dummy_recording(0, with_data=True, source_format=original_format)
+    audio = recording.load_audio()
+
+    assert (
+        recording.source_format == original_format
+    ), f"Recording source format ({recording.source_format}) not matching the expected original format ({original_format})"
+
+    with audio_backend(backend):
+        with AudioTarWriter(
+            str(tmp_path / "test.tar"), shard_size=None, format=writer_format
+        ) as writer:
+            writer.write(
+                key="my-recording",
+                value=audio,
+                sampling_rate=recording.sampling_rate,
+                manifest=recording,
+                original_format=recording.source_format,
+            )
+        (path,) = writer.output_paths
+        ((deserialized_recording, inner_path),) = list(TarIterator(path))
+
+        # make sure the deserialized audio is in the same format as the original
+        assert (
+            deserialized_recording.source_format == original_format
+        ), f"Deserialized recording source format ({deserialized_recording.source_format}) not matching the expected original format ({original_format})"
+
+        # load audio
+        deserialized_audio = deserialized_recording.resample(
+            recording.sampling_rate
+        ).load_audio()
+
+    # check difference between original and deserialized audio
+    rmse = np.sqrt(np.mean((audio - deserialized_audio) ** 2))
+    assert (
+        rmse <= rmse_threshold
+    ), f"RMSE between original and deserialized audio is {rmse}, which is above the threshold of {rmse_threshold}"
+
+
+@pytest.mark.parametrize("shard_offset", [0, 319])
+def test_shar_writer(tmp_path: Path, shard_offset: int):
     # Prepare data
     cuts = DummyManifest(CutSet, begin_id=0, end_id=20, with_data=True)
 
@@ -184,13 +210,14 @@ def test_shar_writer(tmp_path: Path):
         tmp_path,
         fields={
             "recording": "wav",
-            "features": "lilcom",
+            "features": "numpy",
             "custom_embedding": "numpy",
-            "custom_features": "lilcom",
+            "custom_features": "numpy",
             "custom_indexes": "numpy",
             "custom_recording": "wav",
         },
         shard_size=10,
+        shard_offset=shard_offset,
     )
 
     # Actual test
@@ -199,63 +226,65 @@ def test_shar_writer(tmp_path: Path):
             writer.write(c)
 
     # Post-conditions
-
+    sid0 = f"{shard_offset:06d}"
+    sid1 = f"{shard_offset+1:06d}"
+    sid2 = f"{shard_offset+2:06d}"
     assert writer.output_paths == {
         "cuts": [
-            str(tmp_path / "cuts.000000.jsonl.gz"),
-            str(tmp_path / "cuts.000001.jsonl.gz"),
+            str(tmp_path / f"cuts.{sid0}.jsonl.gz"),
+            str(tmp_path / f"cuts.{sid1}.jsonl.gz"),
         ],
         "recording": [
-            str(tmp_path / "recording.000000.tar"),
-            str(tmp_path / "recording.000001.tar"),
+            str(tmp_path / f"recording.{sid0}.tar"),
+            str(tmp_path / f"recording.{sid1}.tar"),
         ],
         "features": [
-            str(tmp_path / "features.000000.tar"),
-            str(tmp_path / "features.000001.tar"),
+            str(tmp_path / f"features.{sid0}.tar"),
+            str(tmp_path / f"features.{sid1}.tar"),
         ],
         "custom_embedding": [
-            str(tmp_path / "custom_embedding.000000.tar"),
-            str(tmp_path / "custom_embedding.000001.tar"),
+            str(tmp_path / f"custom_embedding.{sid0}.tar"),
+            str(tmp_path / f"custom_embedding.{sid1}.tar"),
         ],
         "custom_features": [
-            str(tmp_path / "custom_features.000000.tar"),
-            str(tmp_path / "custom_features.000001.tar"),
+            str(tmp_path / f"custom_features.{sid0}.tar"),
+            str(tmp_path / f"custom_features.{sid1}.tar"),
         ],
         "custom_indexes": [
-            str(tmp_path / "custom_indexes.000000.tar"),
-            str(tmp_path / "custom_indexes.000001.tar"),
+            str(tmp_path / f"custom_indexes.{sid0}.tar"),
+            str(tmp_path / f"custom_indexes.{sid1}.tar"),
         ],
         "custom_recording": [
-            str(tmp_path / "custom_recording.000000.tar"),
-            str(tmp_path / "custom_recording.000001.tar"),
+            str(tmp_path / f"custom_recording.{sid0}.tar"),
+            str(tmp_path / f"custom_recording.{sid1}.tar"),
         ],
     }
 
     # - we created 2 shards with cutsets and a separate file for each data field
     for fname in (
-        "cuts.000000.jsonl.gz",
-        "cuts.000001.jsonl.gz",
-        "recording.000000.tar",
-        "recording.000001.tar",
-        "features.000000.tar",
-        "features.000001.tar",
-        "custom_embedding.000000.tar",
-        "custom_embedding.000001.tar",
-        "custom_features.000000.tar",
-        "custom_features.000001.tar",
-        "custom_indexes.000000.tar",
-        "custom_indexes.000001.tar",
-        "custom_recording.000000.tar",
-        "custom_recording.000001.tar",
+        f"cuts.{sid0}.jsonl.gz",
+        f"cuts.{sid1}.jsonl.gz",
+        f"recording.{sid0}.tar",
+        f"recording.{sid1}.tar",
+        f"features.{sid0}.tar",
+        f"features.{sid1}.tar",
+        f"custom_embedding.{sid0}.tar",
+        f"custom_embedding.{sid1}.tar",
+        f"custom_features.{sid0}.tar",
+        f"custom_features.{sid1}.tar",
+        f"custom_indexes.{sid0}.tar",
+        f"custom_indexes.{sid1}.tar",
+        f"custom_recording.{sid0}.tar",
+        f"custom_recording.{sid1}.tar",
     ):
         assert (tmp_path / fname).is_file()
 
     # - we didn't create a third shard
-    assert not (tmp_path / "cuts.000002.jsonl.gz").exists()
+    assert not (tmp_path / f"cuts.{sid2}.jsonl.gz").exists()
 
     # - the cuts do not have any data actually attached to them,
     #   so it's impossible to load it if we open it as a normal CutSet
-    for cut in CutSet.from_file(tmp_path / "cuts.000000.jsonl.gz"):
+    for cut in CutSet.from_file(tmp_path / f"cuts.{sid0}.jsonl.gz"):
         assert cut.recording.sources[0].type == "shar"
         with pytest.raises(RuntimeError):
             cut.load_audio()
@@ -401,9 +430,9 @@ def test_cut_set_to_shar(tmp_path: Path):
         tmp_path,
         fields={
             "recording": "wav",
-            "features": "lilcom",
+            "features": "numpy",
             "custom_embedding": "numpy",
-            "custom_features": "lilcom",
+            "custom_features": "numpy",
             "custom_indexes": "numpy",
             "custom_recording": "wav",
         },
@@ -534,9 +563,9 @@ def test_shar_writer_not_sharded(tmp_path: Path):
         tmp_path,
         fields={
             "recording": "wav",
-            "features": "lilcom",
+            "features": "numpy",
             "custom_embedding": "numpy",
-            "custom_features": "lilcom",
+            "custom_features": "numpy",
             "custom_indexes": "numpy",
             "custom_recording": "wav",
         },
@@ -622,17 +651,21 @@ def test_shar_writer_pipe(tmp_path: Path):
     cuts = DummyManifest(CutSet, begin_id=0, end_id=20, with_data=True)
 
     # Prepare system under test
+    # Pipe outputs can't carry .idx sidecars (the SharWriter validates that
+    # ``create_index=True`` is only meaningful for local outputs), so we
+    # explicitly opt out here. Indexed reads aren't part of this test.
     writer = SharWriter(
         f"pipe:cat >{tmp_path}",
         fields={
             "recording": "wav",
-            "features": "lilcom",
+            "features": "numpy",
             "custom_embedding": "numpy",
-            "custom_features": "lilcom",
+            "custom_features": "numpy",
             "custom_indexes": "numpy",
             "custom_recording": "wav",
         },
         shard_size=10,
+        create_index=False,
     )
 
     # Actual test

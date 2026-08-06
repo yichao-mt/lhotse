@@ -12,13 +12,14 @@ from lhotse import (
     CutSet,
     Fbank,
     FbankConfig,
-    LilcomChunkyWriter,
     MonoCut,
     NumpyFilesWriter,
     Recording,
     SupervisionSegment,
 )
 from lhotse.array import seconds_to_frames
+from lhotse.audio import save_audio
+from lhotse.features.io import default_features_storage_backend
 from lhotse.supervision import AlignmentItem
 from lhotse.utils import Seconds, uuid4
 
@@ -67,8 +68,6 @@ class RandomCutTestCase:
     def with_recording(
         self, sampling_rate: int, num_samples: int, use_zeros: bool = False
     ) -> Recording:
-        import torchaudio  # torchaudio does not have issues on M1 macs unlike soundfile
-
         f = NamedTemporaryFile("wb", suffix=".wav")
         self.files.append(f)
         duration = num_samples / sampling_rate
@@ -76,7 +75,7 @@ class RandomCutTestCase:
             samples = torch.zeros((1, num_samples))
         else:
             samples = torch.rand((1, num_samples))
-        torchaudio.save(f.name, samples, sample_rate=sampling_rate)
+        save_audio(f.name, samples, sampling_rate=sampling_rate)
         f.flush()
         os.fsync(f)
         return Recording(
@@ -139,7 +138,7 @@ class RandomCutTestCase:
         extractor = Fbank(
             config=FbankConfig(sampling_rate=sampling_rate, frame_shift=frame_shift)
         )
-        with LilcomChunkyWriter(d.name) as storage:
+        with default_features_storage_backend()(d.name) as storage:
             return cut.compute_and_store_features(extractor, storage=storage)
 
     def _with_alignment(

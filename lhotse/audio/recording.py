@@ -2,13 +2,13 @@ from dataclasses import dataclass
 from io import BytesIO
 from math import ceil, isclose
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from _decimal import ROUND_HALF_UP
 
-from lhotse.audio.backend import info, save_audio, torchaudio_info
+from lhotse.audio.backend import get_current_audio_backend, info, save_audio
 from lhotse.audio.source import AudioSource
 from lhotse.audio.utils import (
     AudioLoadingError,
@@ -18,14 +18,18 @@ from lhotse.audio.utils import (
 )
 from lhotse.augmentation import (
     AudioTransform,
+    Clipping,
+    Compress,
     DereverbWPE,
     LoudnessNormalization,
+    Narrowband,
     Resample,
     ReverbWithImpulseResponse,
     Speed,
     Tempo,
     Volume,
 )
+from lhotse.augmentation.compress import Codec
 from lhotse.utils import (
     Pathlike,
     Seconds,
@@ -167,6 +171,23 @@ class Recording:
     def num_channels(self) -> int:
         return len(self.channel_ids)
 
+    @property
+    def source_format(self) -> str:
+        """Infer format of the audio sources.
+        If all sources have the same format, return it.
+        If sources have different formats, raise an error.
+        """
+        source_formats = list(set([s.format for s in self.sources]))
+
+        if len(source_formats) == 1:
+            # if all sources have the same format, return it
+            return source_formats[0]
+        else:
+            # at the moment, we don't resolve different formats
+            raise NotImplementedError(
+                "Sources have different formats. Resolving to a single format not implemented."
+            )
+
     @staticmethod
     def from_file(
         path: Pathlike,
@@ -259,7 +280,7 @@ class Recording:
         :return: a new ``Recording`` instance that owns the byte string data.
         """
         stream = BytesIO(data)
-        audio_info = torchaudio_info(stream)
+        audio_info = get_current_audio_backend().info(stream)
         return Recording(
             id=recording_id,
             sampling_rate=audio_info.samplerate,
@@ -658,6 +679,16 @@ class Recording:
     def with_path_prefix(self, path: Pathlike) -> "Recording":
         return fastcopy(self, sources=[s.with_path_prefix(path) for s in self.sources])
 
+    def copy_with(self, **kwargs) -> "Recording":
+        """
+        Return a copy of this recording with the selected fields overwritten.
+
+        This is a convenience wrapper around :func:`lhotse.utils.fastcopy`, e.g.::
+
+            >>> recording2 = recording.copy_with(id="new-id")
+        """
+        return fastcopy(self, **kwargs)
+
     def with_video_resolution(self, width: int, height: int) -> "Recording":
         return fastcopy(
             self,
@@ -729,6 +760,36 @@ class Recording:
         return fastcopy(
             self,
             id=f"{self.id}_vp{factor}" if affix_id else self.id,
+            transforms=transforms,
+        )
+
+    def narrowband(
+        self, codec: str, restore_orig_sr: bool = True, affix_id: bool = True
+    ) -> "Recording":
+        """
+        Return a new ``Recording`` that will lazily apply narrowband effect while loading audio.
+            by affixing it with "_nb_{codec}".
+
+        :return: a modified copy of the current ``Recording``.
+        """
+        transforms = self.transforms.copy() if self.transforms is not None else []
+        transforms.append(
+            Narrowband(
+                codec=codec,
+                source_sampling_rate=self.sampling_rate,
+                restore_orig_sr=restore_orig_sr,
+            ).to_dict()
+        )
+        new_num_samples = compute_num_samples(
+            self.duration,
+            self.sampling_rate if restore_orig_sr else 8000,
+            rounding=ROUND_HALF_UP,
+        )
+        return fastcopy(
+            self,
+            id=f"{self.id}_nb_{codec}" if affix_id else self.id,
+            num_samples=new_num_samples,
+            sampling_rate=self.sampling_rate if restore_orig_sr else 8000,
             transforms=transforms,
         )
 
@@ -872,6 +933,86 @@ class Recording:
             sampling_rate=sampling_rate,
             transforms=transforms,
         )
+
+    def clip_amplitude(
+        self,
+        hard: bool = False,
+        gain_db: float = 0.0,
+        normalize: bool = True,
+        oversampling: Optional[int] = 4,
+        affix_id: bool = False,
+    ) -> "Recording":
+        """
+        Return a new ``Recording`` that will lazily apply a clipping effect while loading audio.
+        Saturates input signal in [-1, 1] range.
+
+        :param hard: If True, apply hard clipping (sharp cutoff); otherwise, apply soft clipping (saturation).
+        :param gain_db: The amount of gain in decibels to apply before clipping (and to revert back to original level after).
+        :param normalize: If True, normalize the input signal to 0 dBFS before applying clipping.
+        :param oversampling: If provided, we will oversample the input signal by the given integer factor before applying saturation and then downsample back to the original sampling rate.
+        :param affix_id: When true, we will modify the ``Recording.id`` field
+            by affixing it with "_cl{gain_db}".
+        :return: a modified copy of the current ``Recording`` with the saturation transform applied.
+        """
+        transforms = self.transforms.copy() if self.transforms is not None else []
+
+        if oversampling is not None:
+            transforms.append(
+                Resample(
+                    source_sampling_rate=self.sampling_rate,
+                    target_sampling_rate=self.sampling_rate * oversampling,
+                )
+            )
+        transforms.append(Clipping(hard, gain_db, normalize))
+        if oversampling is not None:
+            transforms.append(
+                Resample(
+                    source_sampling_rate=self.sampling_rate * oversampling,
+                    target_sampling_rate=self.sampling_rate,
+                )
+            )
+
+        return fastcopy(
+            self,
+            id=f"{self.id}_cl{gain_db:.1f}" if affix_id else self.id,
+            transforms=transforms,
+        )
+
+    def compress(
+        self, codec: Codec = "opus", compression_level: float = 0.99
+    ) -> "Recording":
+        """
+        Return a new ``Recording`` that will lazily apply audio compression while loading audio.
+
+        :param codec: The codec to use for compression. Supported codecs are "opus", "mp3", "vorbis", "gsm".
+        :param compression_level: The compression level between 0.0 and 1.0 (higher means more compression).
+        :return: a modified copy of the current ``Recording``.
+        """
+        if codec not in Compress.supported_codecs:
+            raise ValueError(
+                f"Invalid codec: {codec}. Must be one of: {', '.join(Compress.supported_codecs)}"
+            )
+        if not 0.0 <= compression_level <= 1.0:
+            raise ValueError(
+                f"Compression level must be between 0.0 and 1.0, got {compression_level}"
+            )
+        transforms = self.transforms.copy() if self.transforms is not None else []
+
+        if codec == "gsm" and self.sampling_rate != 8000:
+            transforms.append(
+                Resample(
+                    source_sampling_rate=self.sampling_rate, target_sampling_rate=8000
+                )
+            )
+            transforms.append(Compress(codec, compression_level))
+            transforms.append(
+                Resample(
+                    source_sampling_rate=8000, target_sampling_rate=self.sampling_rate
+                )
+            )
+        else:
+            transforms.append(Compress(codec, compression_level))
+        return fastcopy(self, transforms=transforms)
 
     @staticmethod
     def from_dict(data: dict) -> "Recording":

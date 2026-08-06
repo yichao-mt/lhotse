@@ -13,12 +13,7 @@ from lhotse.features import Features, FeatureSet
 from lhotse.features.io import MemoryRawWriter
 from lhotse.manipulation import Manifest
 from lhotse.supervision import AlignmentItem, SupervisionSegment, SupervisionSet
-from lhotse.utils import (
-    compute_num_frames,
-    compute_num_samples,
-    fastcopy,
-    is_torchaudio_available,
-)
+from lhotse.utils import compute_num_frames, compute_num_samples, fastcopy
 
 
 @contextlib.contextmanager
@@ -63,6 +58,7 @@ def dummy_recording(
     duration: float = 1.0,
     sampling_rate: int = 16000,
     with_data: bool = False,
+    source_format: str = "wav",
 ) -> Recording:
     num_samples = compute_num_samples(duration, sampling_rate)
     return Recording(
@@ -72,6 +68,7 @@ def dummy_recording(
                 sampling_rate=sampling_rate,
                 num_samples=num_samples,
                 with_data=with_data,
+                format=source_format,
             )
         ],
         sampling_rate=sampling_rate,
@@ -85,6 +82,7 @@ def dummy_audio_source(
     sampling_rate: int = 16000,
     channels: Optional[List[int]] = None,
     with_data: bool = False,
+    format: str = "wav",
 ) -> AudioSource:
     if channels is None:
         channels = [0]
@@ -95,21 +93,40 @@ def dummy_audio_source(
     else:
         import soundfile
 
-        # 1kHz sine wave
-        data = torch.sin(2 * np.pi * 1000 * torch.arange(num_samples))
+        # generate 1kHz sine wave
+        f_sine = 1000
+        assert (
+            f_sine < sampling_rate / 2
+        ), f"Sine wave frequency {f_sine} exceeds Nyquist frequency {sampling_rate/2} for sampling rate {sampling_rate}"
+        data = torch.sin(2 * np.pi * f_sine / sampling_rate * torch.arange(num_samples))
+
+        # prepare multichannel data
         if len(channels) > 1:
             data = data.unsqueeze(0).expand(len(channels), -1).transpose(0, 1)
             # ensure each channel has different data for channel selection testing
             mults = torch.tensor([1 / idx for idx in range(1, len(channels) + 1)])
             data = data * mults
+
+        # prepare source with the selected format
         binary_data = BytesIO()
-        soundfile.write(
-            binary_data,
-            data.numpy(),
-            sampling_rate,
-            format="wav",
-            closefd=False,
-        )
+        if format == "opus":
+            # workaround for OPUS: soundfile supports OPUS as a subtype of OGG format
+            soundfile.write(
+                binary_data,
+                data.cpu().numpy(),
+                sampling_rate,
+                format="OGG",
+                subtype="OPUS",
+                closefd=False,
+            )
+        else:
+            soundfile.write(
+                binary_data,
+                data.cpu().numpy(),
+                sampling_rate,
+                format=format,
+                closefd=False,
+            )
         binary_data.seek(0)
         return AudioSource(
             type="memory", channels=channels, source=binary_data.getvalue()
@@ -206,9 +223,9 @@ def dummy_features(
         num_features=23,
         frame_shift=0.01,
         sampling_rate=16000,
-        storage_type="lilcom_files",
+        storage_type="numpy_files",
         storage_path="test/fixtures/dummy_feats/storage",
-        storage_key="dbf9a0ec-f79d-4eb8-ae83-143a6d5de64d.llc",
+        storage_key="dbf9a0ec-f79d-4eb8-ae83-143a6d5de64d.npy",
     )
 
 
@@ -257,9 +274,9 @@ def dummy_multi_channel_features(
         num_features=23,
         frame_shift=0.01,
         sampling_rate=16000,
-        storage_type="lilcom_files",
+        storage_type="numpy_files",
         storage_path="test/fixtures/dummy_feats/storage",
-        storage_key="dbf9a0ec-f79d-4eb8-ae83-143a6d5de64d.llc",
+        storage_key="dbf9a0ec-f79d-4eb8-ae83-143a6d5de64d.npy",
     )
 
 
@@ -330,7 +347,7 @@ def dummy_cut(
         recording=recording
         if recording
         else dummy_recording(
-            unique_id, duration=recording_duration, with_data=with_data
+            unique_id, duration=max(recording_duration, duration), with_data=with_data
         ),
         features=features
         if features

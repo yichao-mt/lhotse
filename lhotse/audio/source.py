@@ -1,3 +1,5 @@
+import io
+import os
 import warnings
 from dataclasses import dataclass
 from io import BytesIO, FileIO
@@ -6,6 +8,7 @@ from subprocess import PIPE, run
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+import soundfile as sf
 import torch
 
 from lhotse.audio.backend import read_audio
@@ -16,14 +19,8 @@ from lhotse.audio.utils import (
     get_audio_duration_mismatch_tolerance,
 )
 from lhotse.caching import AudioCache
-from lhotse.utils import (
-    Pathlike,
-    Seconds,
-    SmartOpen,
-    asdict_nonull,
-    compute_num_samples,
-    fastcopy,
-)
+from lhotse.serialization import open_best
+from lhotse.utils import Pathlike, Seconds, asdict_nonull, compute_num_samples, fastcopy
 
 PathOrFilelike = Union[str, BytesIO, FileIO]
 
@@ -42,6 +39,8 @@ class AudioSource:
     - 'url' (any URL type that is supported by "smart_open" library, e.g. http/https/s3/gcp/azure/etc.)
     - 'memory' (any format, read from a binary string attached to 'source' member of AudioSource)
     - 'shar' (indicates a placeholder that will be filled later when using Lhotse Shar data format)
+    - 'shar_ptr' (a lazy pointer into a Shar tar shard; resolved by seek+read at load time;
+                  ``source`` is a string of the form ``<tar_path>?o=<offset>&e=<end_offset>``)
     """
 
     channels: List[int]
@@ -63,6 +62,10 @@ class AudioSource:
     @property
     def has_video(self) -> bool:
         return self.video is not None
+
+    @property
+    def format(self) -> str:
+        return self._get_format()
 
     def load_audio(
         self,
@@ -237,6 +240,8 @@ class AudioSource:
 
     @staticmethod
     def from_dict(data) -> "AudioSource":
+        if "video" in data:
+            data["video"] = VideoInfo.from_dict(data["video"])
         return AudioSource(**data)
 
     def __repr__(self):
@@ -259,6 +264,7 @@ class AudioSource:
             "url",
             "memory",
             "shar",
+            "shar_ptr",
         ), f"Unexpected AudioSource type: '{self.type}'"
 
         source = self.source
@@ -295,7 +301,7 @@ class AudioSource:
             # never a microphone-stream or a live-stream.
             audio_bytes = AudioCache.try_cache(self.source)
             if not audio_bytes:
-                with SmartOpen.open(self.source, "rb") as f:
+                with open_best(self.source, "rb") as f:
                     audio_bytes = f.read()
                 AudioCache.add_to_cache(self.source, audio_bytes)
             source = BytesIO(audio_bytes)
@@ -315,4 +321,47 @@ class AudioSource:
                 "that was not filled during deserialization."
             )
 
+        elif self.type == "shar_ptr":
+
+            audio_bytes = AudioCache.try_cache(self.source)
+            if not audio_bytes:
+                from lhotse.shar.lazy_pointer import read_payload
+
+                audio_bytes = read_payload(self.source)
+                AudioCache.add_to_cache(self.source, audio_bytes)
+            source = BytesIO(audio_bytes)
+
         return source
+
+    def _get_format(self) -> str:
+        """Get format for the audio source.
+        If using 'file' or 'url' types, the format is inferred from the file extension, as in soundfile.
+        If using 'memory' or 'shar_ptr' types, the format is inferred from the binary data.
+        """
+        if self.type in ("file", "url"):
+            # Resolve audio format based on the filename
+            format = os.path.splitext(self.source)[-1][1:]
+            return format.lower()
+        elif self.type in ("memory", "shar_ptr"):
+            if self.type == "shar_ptr":
+                # Route through AudioCache to avoid a second tar read when
+                # load_audio() runs after _get_format() (common: format is
+                # queried during recording-level introspection).
+                payload = AudioCache.try_cache(self.source)
+                if not payload:
+                    from lhotse.shar.lazy_pointer import read_payload
+
+                    payload = read_payload(self.source)
+                    AudioCache.add_to_cache(self.source, payload)
+            else:
+                payload = self.source
+            sf_info = sf.info(io.BytesIO(payload))
+            if sf_info.format == "OGG" and sf_info.subtype == "OPUS":
+                # soundfile describes opus as ogg container with opus coding
+                return "opus"
+            else:
+                return sf_info.format.lower()
+        else:
+            raise NotImplementedError(
+                f"Getting format not implemented for source type {self.type}"
+            )

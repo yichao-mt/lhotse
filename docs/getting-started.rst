@@ -9,20 +9,22 @@ Lhotse is a Python library aiming to make speech and audio data preparation flex
 About
 -----
 
-Main goals
-**********
+Main goals (updated for 2025)
+*****************************
 
-* Attract a wider community to speech processing tasks with a **Python-centric design**.
+* Scale to multimodal data pipelines including audio, text, image, and video modalities.
 
-* Accommodate experienced Kaldi users with an **expressive command-line interface**.
+* Provide state-of-the-art dataloading algorithms such as dataset blending and efficient on-the-fly bucketing.
+
+* Handle data randomization (or de-duplication) for distributed multi-node training.
+
+* Attract a wider community to multimodal processing tasks with a **Python-centric design**.
 
 * Provide **standard data preparation recipes** for commonly used corpora.
 
-* Provide **PyTorch Dataset classes** for speech and audio related tasks.
+* Flexible data preparation for model training with the notion of **audio/video cuts**.
 
-* Flexible data preparation for model training with the notion of **audio cuts**.
-
-* **Efficiency**, especially in terms of I/O bandwidth and storage capacity.
+* Support for efficient sequential I/O data formats such as Lhotse Shar (similar to webdataset).
 
 Tutorials
 *********
@@ -39,6 +41,8 @@ We currently have the following tutorials available in `examples` directory:
 
 * Lhotse Shar: storage format optimized for sequential I/O and modularity |tutorial04|
 
+* Image and Video Support in Lhotse |tutorial05|
+
 .. |tutorial00| image:: https://colab.research.google.com/assets/colab-badge.svg
     :target: https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/00-basic-workflow.ipynb
 .. |tutorial01| image:: https://colab.research.google.com/assets/colab-badge.svg
@@ -49,6 +53,8 @@ We currently have the following tutorials available in `examples` directory:
     :target: https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/03-combining-datasets.ipynb
 .. |tutorial04| image:: https://colab.research.google.com/assets/colab-badge.svg
     :target: https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/04-lhotse-shar.ipynb
+.. |tutorial05| image:: https://colab.research.google.com/assets/colab-badge.svg
+    :target: https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/05-image-and-video-loading.ipynb
 
 
 Examples of use
@@ -123,6 +129,10 @@ Lhotse uses several environment variables to customize it's behavior. They are a
 
 * ``LHOTSE_AUDIO_BACKEND`` - may be set to any of the values returned from CLI ``lhotse list-audio-backends`` to override the default behavior of trial-and-error and always use a specific audio backend.
 
+* ``LHOTSE_IO_BACKEND`` - may be set to any of the values returned from CLI ``lhotse list-io-backends`` to override how Lhotse opens paths, URLs, and URIs via ``open_best()`` (for example when reading manifests or URL-backed ``AudioSource`` objects). The same list is also available in Python via ``lhotse.available_io_backends()``.
+
+* ``LHOTSE_RESAMPLING_BACKEND`` - may be set to any of the value returned from CLI ``lhotse list-resampling-backends`` to override the default behavior.
+
 * ``LHOTSE_AUDIO_LOADING_EXCEPTION_VERBOSE`` - when set to 1 we'll emit full exception stack traces when every available audio backend fails to load a given file (they might be very large).
 
 * ``LHOTSE_DILL_ENABLED`` - when it's set to ``1|True|true|yes``, we will enable ``dill``-based serialization of ``CutSet`` and ``Sampler`` across processes (it's disabled by default even when ``dill`` is installed).
@@ -135,6 +145,10 @@ Lhotse uses several environment variables to customize it's behavior. They are a
 
 * ``AIS_ENDPOINT`` is read by AIStore client to determine AIStore endpoint URL. Required for AIStore dataloading.
 
+* ``AIS_CONNECT_TIMEOUT`` - used by AIStore SDK to set the connection timeout (in seconds) for AIStore client requests. Set to ``0`` to disable (no timeout). If not set, the SDK default is used (3s).
+
+* ``AIS_READ_TIMEOUT`` - used by AIStore SDK to set the read timeout (in seconds) for AIStore client requests. Set to ``0`` to disable (no timeout). If not set, the SDK default is used (20s).
+
 * ``RANK``, ``WORLD_SIZE``, ``WORKER``, and ``NUM_WORKERS`` are internally used to inform Lhotse Shar dataloading subprocesses.
 
 * ``READTHEDOCS`` is internally used for documentation builds.
@@ -143,7 +157,13 @@ Lhotse uses several environment variables to customize it's behavior. They are a
 Optional dependencies
 *********************
 
-**Other pip packages.** You can leverage optional features of Lhotse by installing the relevant supporting package like this: ``pip install lhotse[package_name]``. The supported optional packages include:
+**Other pip packages.** You can leverage optional features of Lhotse by installing the relevant supporting package:
+
+* ``pip install lhotse[lilcom]`` to enable lilcom-compressed feature and array storage backends. If storage efficiency is important, ``lilcom_chunky`` is the preferred feature-storage backend once this dependency is installed.
+
+* ``torchcodec`` (>= 0.9, requires torch >= 2.9) is supported as an audio backend when detected. It is a PyTorch-native audio decoder built on FFmpeg. Install it via ``pip install torchcodec``. When installed, it takes precedence over torchaudio in the default backend chain.
+
+* ``torchaudio`` used to be a core dependency in Lhotse, but is now optional. Refer to official PyTorch documentation for installation at `official Pytorch documentation for installation`_.
 
 * ``pip install lhotse[kaldi]`` for a maximal feature set related to Kaldi compatibility. It includes libraries such as ``kaldi_native_io`` (a more efficient variant of ``kaldi_io``) and ``kaldifeat`` that port some of Kaldi functionality into Python.
 
@@ -230,3 +250,4 @@ the speech starts roughly at the first second (100 frames):
 .. _Icefall recipes: https://github.com/k2-fsa/icefall
 .. _orjson: https://pypi.org/project/orjson/
 .. _AIStore: https://aiatscale.org
+.. _official Pytorch documentation for installation: https://pytorch.org/get-started/locally/

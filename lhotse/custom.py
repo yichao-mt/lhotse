@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from lhotse import Recording
-from lhotse.utils import fastcopy, ifnone
+from lhotse.utils import asdict_nonull, fastcopy, ifnone
 
 
 class CustomFieldMixin:
@@ -81,6 +81,9 @@ class CustomFieldMixin:
             raise AttributeError(f"No such member: '{key}'")
         del self.custom[key]
 
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict_nonull(self)
+
     def with_custom(self, name: str, value: Any):
         """Return a copy of this object with an extra custom field assigned to it."""
         cpy = fastcopy(
@@ -89,40 +92,69 @@ class CustomFieldMixin:
         cpy.custom[name] = value
         return cpy
 
-    def load_custom(self, name: str) -> np.ndarray:
+    def copy_with(self, **kwargs):
+        """
+        Return a copy of this manifest with the selected fields overwritten.
+
+        This is a convenience wrapper around :func:`lhotse.utils.fastcopy` that
+        does not require importing it and reads naturally, e.g.::
+
+            >>> supervision2 = supervision.copy_with(text="new text")
+        """
+        return fastcopy(self, **kwargs)
+
+    def load_custom(self, name: str, **kwargs) -> np.ndarray:
         """
         Load custom data as numpy array. The custom data is expected to have
-        been stored in cuts ``custom`` field as an :class:`~lhotse.array.Array` or
-        :class:`~lhotse.array.TemporalArray` manifest.
+        been stored in cuts ``custom`` field as an :class:`~lhotse.array.Array`,
+        :class:`~lhotse.array.TemporalArray`, or :class:`~lhotse.image.image.Image` manifest.
 
-        .. note:: It works with Array manifests stored via attribute assignments,
-            e.g.: ``cut.my_custom_data = Array(...)``.
+        .. note:: It works with Array/Image manifests stored via attribute assignments,
+            e.g.: ``cut.my_custom_data = Array(...)`` or ``cut = cut.attach_image('img', ...)``.
 
         :param name: name of the custom attribute.
         :return: a numpy array with the data.
         """
         from lhotse.array import Array, TemporalArray
+        from lhotse.image.image import Image
 
         value = self.custom.get(name)
         if isinstance(value, Array):
             # Array does not support slicing.
-            return value.load()
+            return value.load(**kwargs)
         elif isinstance(value, TemporalArray):
             # TemporalArray supports slicing.
-            return value.load(start=self.start, duration=self.duration)
+            return value.load(start=self.start, duration=self.duration, **kwargs)
         elif isinstance(value, Recording):
-            # Recording supports slicing.
-            # Note: cut.channels referes to cut.recording and not the custom field.
+            # Note: cut.channels refers to cut.recording and not the custom field.
             # We have to use a special channel selector field instead; e.g.:
             # if this is "target_recording", we'll look for "target_recording_channel_selector"
             channels = self.custom.get(f"{name}_channel_selector")
+            if channels is None and "channel" in kwargs:
+                channels = kwargs.pop(
+                    "channel"
+                )  # channels/channel - being consistent with MultiCut.load_audio/video()
+            # By default, the custom Recording is assumed to be in alignment with cut.recording,
+            # i.e. has the same duration. That means slicing cut.recording should also slice the custom Recording.
+            # If this is not desired, set cut.custom[f"{name}_unaligned]" = True to always load the entire thing.
+            if self.custom.get(f"{name}_unaligned", False):
+                return value.load_audio(channels=channels, **kwargs)
+            if value.has_video:
+                return value.load_video(
+                    channels=channels,
+                    offset=self.start,
+                    duration=self.duration,
+                    **kwargs,
+                )
             return value.load_audio(
-                channels=channels, offset=self.start, duration=self.duration
+                channels=channels, offset=self.start, duration=self.duration, **kwargs
             )
+        elif isinstance(value, Image):
+            return value.load(**kwargs)
         else:
             raise ValueError(
                 f"To load {name}, the cut needs to have field {name} (or cut.custom['{name}']) "
-                f"defined, and its value has to be a manifest of type Array or TemporalArray."
+                f"defined, and its value has to be a manifest of type Array, TemporalArray, or Image."
             )
 
     def has_custom(self, name: str) -> bool:

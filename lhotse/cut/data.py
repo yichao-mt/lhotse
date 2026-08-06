@@ -3,6 +3,7 @@ from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN
 from math import isclose
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -10,6 +11,7 @@ from typing import (
     Generator,
     Iterable,
     List,
+    Literal,
     Optional,
     Tuple,
     Union,
@@ -22,10 +24,12 @@ from intervaltree import IntervalTree
 from lhotse.array import Array, TemporalArray
 from lhotse.audio import Recording, VideoInfo
 from lhotse.augmentation import AugmentFn
+from lhotse.augmentation.compress import Codec
 from lhotse.custom import CustomFieldMixin
 from lhotse.cut.base import Cut
 from lhotse.features import FeatureExtractor, Features
 from lhotse.features.io import FeaturesWriter
+from lhotse.image import Image
 from lhotse.supervision import SupervisionSegment
 from lhotse.utils import (
     LOG_EPSILON,
@@ -37,6 +41,7 @@ from lhotse.utils import (
     compute_num_frames,
     compute_num_samples,
     fastcopy,
+    is_module_available,
     measure_overlap,
     overlaps,
     overspans,
@@ -95,14 +100,14 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
     def iter_data(
         self,
     ) -> Generator[
-        Tuple[str, Union[Recording, Features, Array, TemporalArray]], None, None
+        Tuple[str, Union[Recording, Features, Array, TemporalArray, Image]], None, None
     ]:
         """
         Iterate over each data piece attached to this cut.
         Returns a generator yielding tuples of ``(key, manifest)``, where
         ``key`` is the name of the attribute under which ``manifest`` is found.
         ``manifest`` is of type :class:`~lhotse.Recording`, :class:`~lhotse.Features`,
-        :class:`~lhotse.TemporalArray`, or :class:`~lhotse.Array`.
+        :class:`~lhotse.TemporalArray`, :class:`~lhotse.Array`, or :class:`~lhotse.Image`.
 
         For example, if ``key`` is ``recording``, then ``manifest`` is ``self.recording``.
         """
@@ -111,7 +116,7 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
         if self.has_features:
             yield "features", self.features
         for k, v in (self.custom or {}).items():
-            if isinstance(v, (Recording, Features, Array, TemporalArray)):
+            if isinstance(v, (Recording, Features, Array, TemporalArray, Image)):
                 yield k, v
 
     @property
@@ -458,6 +463,8 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
 
         :param extractor: a ``FeatureExtractor`` instance used to compute the features.
         :param storage: a ``FeaturesWriter`` instance used to write the features to a storage.
+            When the optional ``lilcom`` dependency is installed and on-disk size matters,
+            ``LilcomChunkyWriter`` is the preferred backend.
         :param augment_fn: an optional callable used for audio augmentation.
         :return: a new ``MonoCut`` instance with a ``Features`` manifest attached to it.
         """
@@ -723,7 +730,7 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
         """
         Return a new MixedCut, padded with zeros in the recording, and ``pad_feat_value`` in each feature bin.
 
-        The user can choose to pad either to a specific `duration`; a specific number of frames `max_frames`;
+        The user can choose to pad either to a specific `duration`; a specific number of frames `num_frames`;
         or a specific number of samples `num_samples`. The three arguments are mutually exclusive.
 
         :param duration: The cut's minimal duration after padding.
@@ -752,7 +759,12 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
             pad_value_dict=pad_value_dict,
         )
 
-    def resample(self, sampling_rate: int, affix_id: bool = False) -> "DataCut":
+    def resample(
+        self,
+        sampling_rate: int,
+        affix_id: bool = False,
+        recording_field: Optional[str] = None,
+    ) -> "DataCut":
         """
         Return a new ``DataCut`` that will lazily resample the audio while reading it.
         This operation will drop the feature manifest, if attached.
@@ -761,22 +773,25 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
         :param sampling_rate: The new sampling rate.
         :param affix_id: Should we modify the ID (useful if both versions of the same
             cut are going to be present in a single manifest).
+        :param recording_field: which recording field to resample.
         :return: a modified copy of the current ``DataCut``.
         """
         assert self.has_recording, "Cannot resample a DataCut without Recording."
+
         custom = self.custom
-        if isinstance(custom, dict) and any(
-            isinstance(v, Recording) for v in custom.values()
-        ):
+        recording = self.recording
+        if recording_field is None:
+            recording = recording.resample(sampling_rate)
+        else:
             custom = {
-                k: v.resample(sampling_rate) if isinstance(v, Recording) else v
-                for k, v in custom.items()
+                **custom,
+                recording_field: custom[recording_field].resample(sampling_rate),
             }
 
         return fastcopy(
             self,
             id=f"{self.id}_rs{sampling_rate}" if affix_id else self.id,
-            recording=self.recording.resample(sampling_rate),
+            recording=recording,
             features=None,
             custom=custom,
         )
@@ -918,6 +933,45 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
             supervisions=supervisions_vp,
         )
 
+    def narrowband(
+        self, codec: str, restore_orig_sr: bool = True, affix_id: bool = True
+    ) -> "DataCut":
+        """
+        Return a new ``DataCut`` that will lazily apply narrowband effect.
+
+        :param codec: Codec name.
+        :param restore_orig_sr: Restore original sampling rate.
+        :param affix_id: When true, we will modify the ``DataCut.id`` field
+            by affixing it with "_nb_{codec}".
+        :return: a modified copy of the current ``DataCut``.
+        """
+        # Pre-conditions
+        assert (
+            self.has_recording
+        ), "Cannot apply narrowband effect on a DataCut without Recording."
+        if self.has_features:
+            logging.warning(
+                "Attempting to apply narrowband effect on a DataCut that references pre-computed features. "
+                "The feature manifest will be detached, as we do not support feature-domain "
+                "volume perturbation."
+            )
+            self.features = None
+        # Actual audio perturbation.
+        recording_nb = self.recording.narrowband(
+            codec=codec, restore_orig_sr=restore_orig_sr, affix_id=affix_id
+        )
+        # Match the supervision's id (and it's underlying recording id).
+        supervisions_nb = [
+            s.narrowband(codec=codec, affix_id=affix_id) for s in self.supervisions
+        ]
+
+        return fastcopy(
+            self,
+            id=f"{self.id}_nb_{codec}" if affix_id else self.id,
+            recording=recording_nb,
+            supervisions=supervisions_nb,
+        )
+
     def normalize_loudness(
         self, target: float, affix_id: bool = False, **kwargs
     ) -> "DataCut":
@@ -1012,6 +1066,84 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
     ) -> "DataCut":
         ...
 
+    def clip_amplitude(
+        self,
+        hard: bool = False,
+        gain_db: float = 0.0,
+        normalize: bool = True,
+        oversampling: Optional[int] = 2,
+        affix_id: bool = True,
+    ) -> "DataCut":
+        """
+        Return a new ``DataCut`` that will lazily apply clipping while loading audio.
+
+        :param hard: If True, apply hard clipping (sharp cutoff); otherwise, apply soft clipping (saturation).
+        :param gain_db: The amount of gain in decibels to apply before clipping.
+        :param normalize: If True, normalize the input signal to 0 dBFS before applying clipping.
+        :param oversampling: If provided, we will oversample the input signal by the given integer factor before applying saturation and then downsample back to the original sampling rate.
+        :param affix_id: When true, we will modify the ``DataCut.id`` field
+            by affixing it with "_cl{gain_db}".
+        :return: a modified copy of the current ``DataCut``.
+        """
+        assert (
+            self.has_recording
+        ), "Cannot apply saturation on a DataCut without Recording."
+        if self.has_features:
+            logging.warning(
+                "Attempting to apply saturation on a DataCut that references pre-computed features. "
+                "The feature manifest will be detached, as we do not support feature-domain "
+                "saturation."
+            )
+
+        recording_saturated = self.recording.clip_amplitude(
+            hard=hard,
+            gain_db=gain_db,
+            normalize=normalize,
+            oversampling=oversampling,
+            affix_id=affix_id,
+        )
+
+        return fastcopy(
+            self,
+            id=f"{self.id}_cl{gain_db}" if affix_id else self.id,
+            recording=recording_saturated,
+        )
+
+    def compress(
+        self,
+        codec: Codec = "opus",
+        compression_level: float = 0.99,
+        compress_custom_fields: bool = False,
+    ) -> "DataCut":
+        """
+        Return a copy of this Cut that has its Recordings processed by a lossy audio encoder.
+
+        :param codec: The codec to use for compression. Supported codecs are "opus", "mp3", "vorbis", "gsm".
+        :param compression_level: The level of compression (from 0.0 to 1.0, higher values correspond to higher compression).
+        :param compress_custom_fields: Whether to also compress any custom recording fields in the Cut.
+
+        :return: A modified :class:`~lhotse.DataCut` containing audio processed by a codec
+        """
+        assert self.has_recording, "Cannot compress a DataCut without a Recording."
+
+        custom = self.custom
+        if compress_custom_fields:
+            if isinstance(custom, dict) and any(
+                isinstance(v, Recording) for v in custom.values()
+            ):
+                custom = {
+                    k: v.compress(codec, compression_level)
+                    if isinstance(v, Recording)
+                    else v
+                    for k, v in custom.items()
+                }
+
+        return fastcopy(
+            self,
+            recording=self.recording.compress(codec, compression_level),
+            custom=custom,
+        )
+
     def map_supervisions(
         self, transform_fn: Callable[[SupervisionSegment], SupervisionSegment]
     ) -> "DataCut":
@@ -1069,3 +1201,69 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
         if not self.has_recording:
             return self
         return fastcopy(self, recording=self.recording.with_path_prefix(path))
+
+    def attach_image(
+        self, key: str, path_or_object: Union[str, np.ndarray, bytes]
+    ) -> "DataCut":
+        """
+        Attach an image to this cut, wrapped in an Image class and stored
+        under `key` in the `custom` dict.
+
+        The image can be specified as:
+        - A path to an image file
+        - A numpy array with shape (height, width, channels)
+        - Raw bytes of an image file
+
+        Example::
+
+            >>> cut = cut.attach_image('thumbnail', 'path/to/image.jpg')
+            >>> # Access the image later
+            >>> img_array = cut.load_thumbnail()  # Returns numpy array
+
+        :param key: The key to store the image under in the custom dict.
+        :param path_or_object: The image as a path, numpy array, or bytes.
+        :return: A new DataCut with the image attached.
+        """
+        assert is_module_available(
+            "PIL"
+        ), "In order to use images, please run 'pip install pillow'"
+
+        from lhotse.image.image import Image
+        from lhotse.image.io import PillowInMemoryWriter
+
+        # Make a copy of the cut with the image stored in custom dict
+        cpy = fastcopy(
+            self, custom=self.custom.copy() if self.custom is not None else {}
+        )
+
+        # Handle different types of input
+        if isinstance(path_or_object, (str, Path)):
+            # It's a path, directly reference the file without writing anything
+            # Get the dimensions by opening the image
+            import PIL.Image as PILImage
+
+            with PILImage.open(path_or_object) as img:
+                width, height = img.size
+
+            # Create an Image manifest pointing to the original file
+            # We'll use the original file extension to determine the file name in storage_key
+            path = Path(path_or_object)
+            storage_key = str(path.name)
+            # Use the parent directory as storage_path
+            storage_path = str(path.parent)
+
+            image_manifest = Image(
+                storage_type="pillow_files",
+                storage_path=storage_path,
+                storage_key=storage_key,
+                width=width,
+                height=height,
+            )
+        else:
+            # For numpy arrays or bytes, use in-memory writer
+            writer = PillowInMemoryWriter()
+            with writer:
+                image_manifest = writer.store_image(key, path_or_object)
+
+        cpy.custom[key] = image_manifest
+        return cpy

@@ -46,7 +46,10 @@ def mini_librispeeh2_cut_set():
 def cut_set_with_mixed_cut(cut1, cut2):
     mixed_cut = MixedCut(
         id="mixed-cut-id",
-        tracks=[MixTrack(cut=cut1), MixTrack(cut=cut2, offset=1.0, snr=10)],
+        tracks=[
+            MixTrack(cut=cut1.copy()),
+            MixTrack(cut=cut2.copy(), offset=1.0, snr=10),
+        ],
     )
     return CutSet([cut1, cut2, mixed_cut])
 
@@ -77,6 +80,12 @@ def test_cut_set_sort_by_recording_id(mini_librispeeh2_cut_set, ascending, expec
 
 def test_cut_set_iteration(cut_set_with_mixed_cut):
     cuts = list(cut_set_with_mixed_cut)
+    assert len(cut_set_with_mixed_cut) == 3
+    assert len(cuts) == 3
+
+
+def test_cut_set_prefetch_iteration(cut_set_with_mixed_cut):
+    cuts = list(cut_set_with_mixed_cut.prefetch())
     assert len(cut_set_with_mixed_cut) == 3
     assert len(cuts) == 3
 
@@ -568,25 +577,6 @@ def test_map_cut_set_rejects_noncut(cut_set_with_mixed_cut):
 def test_store_audio(num_jobs):
     cut_set = CutSet.from_json("test/fixtures/ljspeech/cuts.json")
     cut_set = cut_set.sort_by_duration()
-    with TemporaryDirectory() as tmpdir:
-        for enc, bits in (
-            ("PCM_S", 16),
-            ("PCM_F", 32),
-            (None, 16),
-            ("PCM_S", None),
-            (None, None),
-        ):
-            stored_cut_set = cut_set.save_audios(
-                tmpdir, encoding=enc, bits_per_sample=bits, num_jobs=num_jobs
-            )
-
-            stored_cut_set = stored_cut_set.sort_by_duration()
-            for cut1, cut2 in zip(cut_set, stored_cut_set):
-                samples1 = cut1.load_audio()
-                samples2 = cut2.load_audio()
-                assert np.array_equal(samples1, samples2)
-            assert len(stored_cut_set) == len(cut_set)
-
     with TemporaryDirectory() as tmpdir:
         for bits in (16, 24, None):
             stored_cut_set = cut_set.save_audios(

@@ -4,14 +4,23 @@ import os
 import sys
 import warnings
 from codecs import StreamReader, StreamWriter
+from contextlib import contextmanager
 from functools import lru_cache
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, Optional, Type, Union
+from typing import Any, Dict, Generator, Iterable, List, Optional, Type, Union
 
 import yaml
+from packaging.version import parse as parse_version
 
-from lhotse.utils import Pathlike, SmartOpen, is_module_available, is_valid_url
+from lhotse.utils import (
+    Pathlike,
+    Pipe,
+    SmartOpen,
+    is_module_available,
+    is_valid_url,
+    replace_bucket_with_profile_name,
+)
 from lhotse.workarounds import gzip_open_robust
 
 # TODO: figure out how to use some sort of typing stubs
@@ -30,59 +39,22 @@ def open_best(path: Pathlike, mode: str = "r"):
     either stdin or stdout depending on the mode.
     The concept is similar to Kaldi's "generalized pipes", but uses WebDataset syntax.
     """
-    strpath = str(path)
-    if strpath == "-":
-        if mode == "r":
-            return StdStreamWrapper(sys.stdin)
-        elif mode == "w":
-            return StdStreamWrapper(sys.stdout)
-        else:
-            raise ValueError(
-                f"Cannot open stream for '-' with mode other 'r' or 'w' (got: '{mode}')"
-            )
-
     if isinstance(path, (BytesIO, StringIO, StreamWriter, StreamReader)):
         return path
-
-    if strpath.startswith("pipe:"):
-        return open_pipe(path[5:], mode)
-
-    if strpath.startswith("ais://"):
-        return open_aistore(path, mode)
-
-    if is_valid_url(strpath):
-        if is_aistore_available():
-            return open_aistore(path, mode)
-        elif is_module_available("smart_open"):
-            return SmartOpen.open(path, mode)
-        else:
+    assert isinstance(
+        path, (str, Path)
+    ), f"Unexpected identifier type {type(path)} for object {path}. Expected str or pathlib.Path."
+    try:
+        return get_current_io_backend().open(path, mode)
+    except Exception:
+        if is_valid_url(path):
             raise ValueError(
+                f"Error trying to open what seems to be a URI: '{path}'\n"
                 f"In order to open URLs/URIs please run 'pip install smart_open' "
                 f"(if you're trying to use AIStore, either the Python SDK is not installed (pip install aistore) "
                 f"or {AIS_ENDPOINT_ENVVAR} is not defined."
             )
-
-    if is_module_available("smart_open"):
-        return SmartOpen.open(path, mode)
-
-    compressed = strpath.endswith(".gz")
-    if compressed:
-        if "t" not in mode and "b" not in mode:
-            # Opening as bytes not requested explicitly, use "t" to tell gzip to handle unicode.
-            mode = mode + "t"
-        return gzip_open_robust(path, mode)
-
-    return open(path, mode)
-
-
-def open_pipe(cmd: str, mode: str):
-    """
-    Runs the command and redirects stdin/stdout depending on the mode.
-    Returns a file-like object that can be read from or written to.
-    """
-    from lhotse.utils import Pipe
-
-    return Pipe(cmd, mode=mode, shell=True, bufsize=8092)
+        raise
 
 
 AIS_ENDPOINT_ENVVAR = "AIS_ENDPOINT"
@@ -105,17 +77,16 @@ def get_aistore_client():
         raise ValueError(
             "Set a valid URL as AIS_ENDPOINT environment variable's value to read data from AIStore."
         )
-    from aistore import Client
+    import aistore
 
     endpoint_url = os.environ["AIS_ENDPOINT"]
-    return Client(endpoint_url)
-
-
-def open_aistore(uri: str, mode: str):
-    assert "r" in mode, "We only support reading from AIStore at this time."
-    client = get_aistore_client()
-    object = client.fetch_object_by_url(uri)
-    return object.get().raw()
+    version = parse_version(aistore.__version__)
+    # NOTE: No explicit timeout is passed here so that the AIStore SDK picks up
+    # the 'AIS_CONNECT_TIMEOUT' and 'AIS_READ_TIMEOUT' environment variables
+    # when they are set. Users should configure these env vars to control
+    # request timeouts.
+    # See https://github.com/NVIDIA/aistore/tree/main/python/aistore/sdk#environment-variables
+    return aistore.Client(endpoint_url, max_pool_size=50), version
 
 
 def save_to_yaml(data: Any, path: Pathlike) -> None:
@@ -222,11 +193,6 @@ class SequentialJsonlWriter:
     def __init__(self, path: Pathlike, overwrite: bool = True) -> None:
         self.path = path
         self.file = None
-        if not (extension_contains(".jsonl", self.path) or (self.path == "-")):
-            raise InvalidPathExtension(
-                f"SequentialJsonlWriter supports only JSONL format (one JSON item per line), "
-                f"but path='{path}'."
-            )
         self.mode = "w"
         self.ignore_ids = set()
         if Path(self.path).is_file() and not overwrite:
@@ -436,14 +402,32 @@ class LazyMixin:
         return not isinstance(self.data, (dict, list, tuple))
 
     @classmethod
-    def from_jsonl_lazy(cls, path: Pathlike) -> Manifest:
+    def from_jsonl_lazy(
+        cls,
+        path: Pathlike,
+        shuffle: bool = False,
+        seed: int = 0,
+    ) -> Manifest:
         """
         Read a JSONL manifest in a lazy manner, which opens the file but does not
         read it immediately. It is only suitable for sequential reads and iteration.
 
+        When ``shuffle=True``, uses :class:`~lhotse.lazy.LazyIndexedManifestIterator`
+        backed by a binary index file for O(1) random-access shuffled iteration.
+        The JSONL file must be uncompressed (``.jsonl``, not ``.jsonl.gz``).
+
+        :param path: path to a JSONL manifest file.
+        :param shuffle: when ``True``, use indexed shuffled iteration.
+        :param seed: random seed for shuffled iteration (only used when ``shuffle=True``).
+
         .. warning:: Opening the manifest in this way might cause some methods that
-            rely on random access to fail.
+            rely on random access to fail (unless ``shuffle=True`` or the file
+            has been indexed).
         """
+        if shuffle:
+            from lhotse.lazy import LazyIndexedManifestIterator
+
+            return cls(LazyIndexedManifestIterator(path, shuffle=True, seed=seed))
         from lhotse.lazy import LazyManifestIterator
 
         return cls(LazyManifestIterator(path))
@@ -503,10 +487,26 @@ def load_manifest(path: Pathlike, manifest_cls: Optional[Type] = None) -> Manife
     return data_set
 
 
-def load_manifest_lazy(path: Pathlike) -> Optional[Manifest]:
+def load_manifest_lazy(
+    path: Pathlike,
+    indexed: Optional[bool] = None,
+    shuffle: bool = False,
+    seed: int = 0,
+    index_path: Optional[Pathlike] = None,
+) -> Optional[Manifest]:
     """
     Generic utility for reading an arbitrary manifest from a JSONL file.
     Returns None when the manifest is empty.
+
+    :param path: path to a JSONL manifest file.
+    :param indexed: ``True`` forces indexed mode, ``False`` forces the
+        default lazy reader, ``None`` auto-detects (indexed when ``.idx``
+        exists).
+    :param shuffle: when ``True``, use Feistel-cipher shuffled iteration
+        (requires uncompressed ``.jsonl``).  Implies ``indexed=True``.
+    :param seed: random seed for shuffled iteration (only used when
+        ``shuffle=True``).
+    :param index_path: optional custom path to the ``.idx`` file.
     """
     assert extension_contains(".jsonl", path) or str(path) == "-"
     raw_data = iter(load_jsonl(path))
@@ -516,18 +516,59 @@ def load_manifest_lazy(path: Pathlike) -> Optional[Manifest]:
         return None  # empty manifest
     item = deserialize_item(first)
     cls = resolve_manifest_set_class(item)
+
+    if shuffle:
+        from lhotse.lazy import LazyIndexedManifestIterator
+
+        return cls(
+            LazyIndexedManifestIterator(
+                path, shuffle=True, seed=seed, index_path=index_path
+            )
+        )
+
+    if indexed is None:
+        if index_path is not None:
+            use_indexed = True
+        else:
+            # Auto-detect: use indexed mode if the .idx file already exists
+            from lhotse.indexing import index_exists
+
+            use_indexed = (
+                str(path) != "-"
+                and not extension_contains(".gz", path)
+                and index_exists(path)
+            )
+    else:
+        use_indexed = indexed
+
+    if use_indexed:
+        from lhotse.lazy import LazyIndexedManifestIterator
+
+        return cls(LazyIndexedManifestIterator(path, index_path=index_path))
     return cls.from_jsonl_lazy(path)
 
 
 def load_manifest_lazy_or_eager(
-    path: Pathlike, manifest_cls=None
+    path: Pathlike,
+    manifest_cls=None,
+    indexed: Optional[bool] = None,
+    shuffle: bool = False,
+    seed: int = 0,
+    index_path: Optional[Pathlike] = None,
 ) -> Optional[Manifest]:
     """
     Generic utility for reading an arbitrary manifest.
     If possible, opens the manifest lazily, otherwise reads everything into memory.
+
+    :param indexed: passed through to :func:`load_manifest_lazy`.
+    :param shuffle: passed through to :func:`load_manifest_lazy`.
+    :param seed: passed through to :func:`load_manifest_lazy`.
+    :param index_path: passed through to :func:`load_manifest_lazy`.
     """
     if extension_contains(".jsonl", path) or str(path) == "-":
-        return load_manifest_lazy(path)
+        return load_manifest_lazy(
+            path, indexed=indexed, shuffle=shuffle, seed=seed, index_path=index_path
+        )
     else:
         return load_manifest(path, manifest_cls=manifest_cls)
 
@@ -574,8 +615,39 @@ def store_manifest(manifest: Manifest, path: Pathlike) -> None:
 
 class Serializable(JsonMixin, JsonlMixin, LazyMixin, YamlMixin):
     @classmethod
-    def from_file(cls, path: Pathlike) -> Manifest:
-        return load_manifest_lazy_or_eager(path, manifest_cls=cls)
+    def from_file(
+        cls,
+        path: Pathlike,
+        indexed: Optional[bool] = None,
+        shuffle: bool = False,
+        seed: int = 0,
+        index_path: Optional[Pathlike] = None,
+    ) -> Manifest:
+        """
+        Read a manifest from a file.
+
+        :param path: path to a manifest file (JSONL, JSON, or YAML).
+        :param indexed: controls whether to use indexed random-access reading
+            for JSONL files.  ``True`` forces indexed mode (requires
+            uncompressed ``.jsonl``).  ``False`` uses the default lazy reader.
+            ``None`` (default) auto-detects: uses indexed mode when a ``.idx``
+            file already exists alongside the JSONL file.
+        :param shuffle: when ``True``, use Feistel-cipher shuffled iteration
+            (requires uncompressed ``.jsonl``).  Implies ``indexed=True``.
+        :param seed: random seed for shuffled iteration (only used when
+            ``shuffle=True``).
+        :param index_path: optional path to the ``.idx`` file stored
+            separately from the data file.  When set and ``indexed`` is
+            ``None``, auto-detection resolves to ``True``.
+        """
+        return load_manifest_lazy_or_eager(
+            path,
+            manifest_cls=cls,
+            indexed=indexed,
+            shuffle=shuffle,
+            seed=seed,
+            index_path=index_path,
+        )
 
     def to_file(self, path: Pathlike) -> None:
         store_manifest(self, path)
@@ -584,10 +656,12 @@ class Serializable(JsonMixin, JsonlMixin, LazyMixin, YamlMixin):
 def deserialize_item(data: dict) -> Any:
     # Figures out what type of manifest is being decoded with some heuristics
     # and returns a Lhotse manifest object rather than a raw dict.
-    from lhotse import Features, MonoCut, MultiCut, Recording, SupervisionSegment
+    from lhotse import Features, Image, MonoCut, MultiCut, Recording, SupervisionSegment
     from lhotse.array import deserialize_array
     from lhotse.cut import MixedCut
 
+    if "width" in data:
+        return Image.from_dict(data)
     if "shape" in data or "array" in data:
         return deserialize_array(data)
     if "sources" in data:
@@ -627,6 +701,7 @@ def deserialize_custom_field(data: Optional[dict]) -> Optional[dict]:
     if data is None:
         return None
 
+    from lhotse import Image
     from lhotse.array import deserialize_array
     from lhotse.audio import Recording
 
@@ -639,6 +714,8 @@ def deserialize_custom_field(data: Optional[dict]) -> Optional[dict]:
             if all(k in value for k in ("id", "sources", "sampling_rate")):
                 data[key] = Recording.from_dict(value)
                 continue
+            if "width" in value:
+                data[key] = Image.from_dict(value)
             try:
                 data[key] = deserialize_array(value)
             except:
@@ -677,3 +754,480 @@ class StdStreamWrapper:
         if item == "close":
             return self.close
         return getattr(self.stream, item)
+
+
+class IOBackend:
+    """
+    Base class for IO backends supported by Lhotse.
+    An IO backend supports open() operations for reads and/or writes to file-like objects.
+    Deriving classes are auto-registered under their class name, and auto-discoverable
+    through functions:
+
+    * :func:`~lhotse.serialization.available_io_backends`
+
+    * :func:`~lhotse.serialization.get_current_io_backend`
+
+    * :func:`~lhotse.serialization.set_current_io_backend`
+
+    The default composite backend that tries to figure out the best solution
+    can be obtained via :func:`~lhotse.serialization.get_default_io_backend`.
+
+    New IO backends are expected to define the following methods:
+
+    * `open(identifier: str, mode: str)` which returns a file-like object.
+        Must be implemented.
+
+    * `is_applicable(identifier: str) -> bool` returns `True` if a given
+        backend can be used for a given identifier. True by default.
+
+    * `is_available(identifier: str) -> bool` Class method. Only define it when
+        the availability of the backend depends on some special actions,
+        such as installing an option dependency.
+
+    * `handles_special_case(identifier: str) -> bool` defined ONLY when
+        a given IO Backend MUST be selected for a specific identifier.
+        For example, only :class:`~lhotse.serialization.PipeIOBackend` handles
+        piped commands like `"pipe:gunzip -c manifest.jsonl.gz"`.
+    """
+
+    KNOWN_BACKENDS = {}
+
+    def __init_subclass__(cls, **kwargs):
+        if cls.__name__ not in IOBackend.KNOWN_BACKENDS:
+            IOBackend.KNOWN_BACKENDS[cls.__name__] = cls
+        super().__init_subclass__(**kwargs)
+
+    @classmethod
+    def new(cls, name: str) -> "IOBackend":
+        if name not in cls.KNOWN_BACKENDS:
+            raise RuntimeError(f"Unknown IO backend name: {name}")
+        return cls.KNOWN_BACKENDS[name]()
+
+    def open(self, identifier: Pathlike, mode: str):
+        raise NotImplementedError()
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return True
+
+    def handles_special_case(self, identifier: Pathlike) -> bool:
+        return False
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return True
+
+
+class BuiltinIOBackend(IOBackend):
+    """Calls Python's built-in `open`."""
+
+    def open(self, identifier: Pathlike, mode: str):
+        return open(identifier, mode=mode)
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return not is_valid_url(identifier)
+
+
+class RedirectIOBackend(IOBackend):
+    """Opens a stream to stdin or stdout."""
+
+    def open(self, identifier: Pathlike, mode: str):
+        if mode == "r":
+            return StdStreamWrapper(sys.stdin)
+        elif mode == "w":
+            return StdStreamWrapper(sys.stdout)
+        raise ValueError(
+            f"Cannot open stream for '-' with mode other 'r' or 'w' (got: '{mode}')"
+        )
+
+    def handles_special_case(self, identifier: Pathlike) -> bool:
+        return identifier == "-"
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return self.handles_special_case(identifier)
+
+
+class PipeIOBackend(IOBackend):
+    """Executes the provided command / pipe and wraps it into a file-like object."""
+
+    def open(self, identifier: Pathlike, mode: str):
+        """
+        Runs the command and redirects stdin/stdout depending on the mode.
+        Returns a file-like object that can be read from or written to.
+        """
+        return Pipe(str(identifier)[5:], mode=mode, shell=True, bufsize=8092)
+
+    def handles_special_case(self, identifier: Pathlike) -> bool:
+        return str(identifier).startswith("pipe:")
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return self.handles_special_case(identifier)
+
+
+class GzipIOBackend(IOBackend):
+    """Uses gzip.open to automatically (de)compress."""
+
+    def open(self, identifier: Pathlike, mode: str):
+        if "t" not in mode and "b" not in mode:
+            # Opening as bytes not requested explicitly, use "t" to tell gzip to handle unicode.
+            mode = mode + "t"
+        return gzip_open_robust(identifier, mode)
+
+    def handles_special_case(self, identifier: Pathlike) -> bool:
+        identifier = str(identifier)
+        return identifier.endswith(".gz") and not is_valid_url(identifier)
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return self.handles_special_case(identifier)
+
+
+class SmartOpenIOBackend(IOBackend):
+    """Uses `smart_open` library (if installed) to auto-determine how to handle the URI."""
+
+    def open(self, identifier: Pathlike, mode: str):
+        return SmartOpen.open(identifier, mode)
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return is_module_available("smart_open")
+
+
+class AIStoreIOBackend(IOBackend):
+    """
+    Uses `aistore` client (if installed and enabled via AIS_ENDPOINT env var)
+    to download data from AIStore if the identifier is a URL/URI.
+    """
+
+    def open(self, identifier: str, mode: str):
+        client, version = get_aistore_client()
+        try:
+            object = client.get_object_from_url(identifier)
+        except AttributeError:  # older AIStore client
+            object = client.fetch_object_by_url(identifier)
+        if "r" in mode:
+            try:
+                # AIStore >= 1.10.0
+                request = object.get_reader()
+            except AttributeError:
+                # AIStore < 1.10.0 deprecated method
+                request = object.get()
+            if version >= parse_version("1.9.1"):
+                # AIStore SDK 1.9.1 supports ObjectFile for improved read fault resiliency
+                fileobj = request.as_file()
+            else:
+                fileobj = request.raw()
+            if identifier.endswith(".gz"):
+                fileobj = gzip_open_robust(fileobj)
+            return fileobj
+        if "w" in mode:
+            assert version >= parse_version("1.10.0"), (
+                f"Writing to AIStore requires at least version 1.10.0 of AIStore Python SDK, "
+                f"but your version is {version}"
+            )
+            return object.get_writer().as_file()
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return (
+            is_module_available("aistore")
+            and AIS_ENDPOINT_ENVVAR in os.environ
+            and is_valid_url(os.environ[AIS_ENDPOINT_ENVVAR])
+        )
+
+    def handles_special_case(self, identifier: Pathlike) -> bool:
+        return str(identifier).startswith("ais://")
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return is_valid_url(identifier)
+
+
+def get_lhotse_msc_override_protocols() -> Any:
+    return os.getenv("LHOTSE_MSC_OVERRIDE_PROTOCOLS", None)
+
+
+def get_lhotse_msc_profile() -> Any:
+    return os.getenv("LHOTSE_MSC_PROFILE", None)
+
+
+def get_lhotse_msc_backend_forced() -> Any:
+    """
+    If set to True, the MSC backend will be forced to be used for regular URLs.
+    """
+    val = os.getenv("LHOTSE_MSC_BACKEND_FORCED", "False")
+    return val.lower() == "true"
+
+
+MSC_PREFIX = "msc"
+
+
+class MSCIOBackend(IOBackend):
+    """
+    Uses Multi-Storage Client to download data from object store.
+
+    Multi-Storage Client (MSC) is a Python library aims at providing a unified interface to object and file
+    storage backends, including S3, GCS, AIStore, and more.  With no code change, user can seamlessly switch
+    between different storage backends with corresponding MSC urls.
+
+    To use MSCIOBackend, user will need
+
+    1)
+    MSC config file that specifies the storage backend information. Please refer to the MSC documentation
+    for more details: https://nvidia.github.io/multi-storage-client/user_guide/quickstart.html#configuration
+
+    2)
+    Provide MSC URLs, OR
+    Set env `LHOTSE_MSC_BACKEND_FORCED` to True to force the use of MSC backend for regular URLs.
+
+    To learn more about MSC, please check out the GitHub repo: https://github.com/NVIDIA/multi-storage-client
+    """
+
+    def open(self, identifier: str, mode: str):
+        """
+        Convert identifier if is not prefixed with msc, and use msc.open to access the file
+        For paths that are prefixed with msc, e.g. msc://profile/path/to/my/object1
+
+        For paths are yet to migrate to msc-compatible url, e.g. protocol://bucket/path/to/my/object2
+        1. override protocols provided by env LHOTSE_MSC_OVERRIDE_PROTOCOLS to msc: msc://bucket/path/to/my/object2
+        2. override the profile/bucket name by env LHOTSE_MSC_PROFILE if provided: msc://profile/path/to/my/object2,
+        if bucket name is not provided, then we expect the msc profile name to match with bucket name
+        """
+        if not is_module_available("multistorageclient"):
+            raise RuntimeError(
+                "Please run 'pip install multistorageclient' in order to use MSCIOBackend."
+            )
+
+        import multistorageclient as msc
+
+        # if url prefixed with msc, then return early
+        if MSCIOBackend.is_msc_url(identifier):
+            return msc.open(identifier, mode)
+
+        # override protocol if provided
+        lhotse_msc_override_protocols = get_lhotse_msc_override_protocols()
+        if lhotse_msc_override_protocols:
+            if "," in lhotse_msc_override_protocols:
+                override_protocol_list = lhotse_msc_override_protocols.split(",")
+            else:
+                override_protocol_list = [lhotse_msc_override_protocols]
+            for override_protocol in override_protocol_list:
+                if identifier.startswith(override_protocol):
+                    identifier = identifier.replace(override_protocol, MSC_PREFIX)
+                    break
+
+        # override bucket if provided
+        lhotse_msc_profile = get_lhotse_msc_profile()
+        if lhotse_msc_profile:
+            identifier = replace_bucket_with_profile_name(
+                identifier, lhotse_msc_profile
+            )
+
+        try:
+            file = msc.open(identifier, mode)
+        except Exception as e:
+            print(f"exception: {e}, identifier: {identifier}")
+            raise e
+
+        return file
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return is_module_available("multistorageclient")
+
+    def handles_special_case(self, identifier: Pathlike) -> bool:
+        return MSCIOBackend.is_msc_url(identifier)
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return is_module_available("multistorageclient") and (
+            MSCIOBackend.is_msc_url(identifier)
+            or (get_lhotse_msc_backend_forced() and is_valid_url(identifier))
+        )
+
+    @staticmethod
+    def is_msc_url(identifier: Any) -> bool:
+        return str(identifier).startswith(f"{MSC_PREFIX}://")
+
+
+class CompositeIOBackend(IOBackend):
+    """
+    Composes multiple IO backends together.
+    Uses `handles_special_case` and `is_applicable` of sub-backends to auto-detect
+    which backend to select.
+
+    In case of `handles_special_case`, if multiple backends could have worked,
+    we'll use the first one in the list.
+    """
+
+    def __init__(self, backends: List[IOBackend]):
+        self.backends = backends
+
+    def open(self, identifier: Pathlike, mode: str):
+        for b in self.backends:
+            if b.handles_special_case(identifier):
+                return b.open(identifier, mode)
+
+        for b in self.backends:
+            if b.is_applicable(identifier):
+                return b.open(identifier, mode)
+
+        raise RuntimeError(
+            f"Couldn't find a suitable IOBackend for input '{identifier}'"
+        )
+
+    def handles_special_case(self, identifier: Pathlike) -> bool:
+        return any(b.handles_special_case(identifier) for b in self.backends)
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return any(b.is_applicable(identifier) for b in self.backends)
+
+
+CURRENT_IO_BACKEND: Optional["IOBackend"] = None
+
+
+def available_io_backends() -> List[str]:
+    """
+    Return a list of names of available IO backends, including "default".
+    """
+    return ["default"] + sorted(
+        b
+        for b in IOBackend.KNOWN_BACKENDS
+        if IOBackend.KNOWN_BACKENDS[b].is_available()
+    )
+
+
+@contextmanager
+def io_backend(backend: Union["IOBackend", str]) -> Generator["IOBackend", None, None]:
+    """
+    Context manager that sets Lhotse's IO backend to the specified value
+    and restores the previous IO backend at the end of its scope.
+
+    Example::
+
+        >>> with io_backend("AIStoreIOBackend"):
+        ...     cuts = CutSet.from_file(...)  # forced open() via AIStore client
+    """
+    previous = get_current_io_backend()
+    b = set_current_io_backend(backend)
+    yield b
+    set_current_io_backend(previous)
+
+
+def get_current_io_backend() -> "IOBackend":
+    """
+    Return the backend currently set by the user, or default.
+    """
+    global CURRENT_IO_BACKEND
+
+    # First check if the user has programmatically overridden the backend.
+    if CURRENT_IO_BACKEND is not None:
+        return CURRENT_IO_BACKEND
+
+    # Then, check if the user has overridden the audio backend via an env var.
+    maybe_backend = os.environ.get("LHOTSE_IO_BACKEND")
+    if maybe_backend is not None:
+        return set_current_io_backend(maybe_backend)
+
+    # Lastly, fall back to the default backend.
+    return set_current_io_backend("default")
+
+
+def set_current_io_backend(backend: Union["IOBackend", str]) -> "IOBackend":
+    """
+    Force Lhotse to use a specific IO backend to open every path/URL/URI,
+    overriding the default behaviour of "educated guessing".
+
+    Example forcing Lhotse to use ``aistore`` library for every IO open() operation::
+
+        >>> set_current_io_backend(AIStoreIOBackend())
+    """
+    global CURRENT_IO_BACKEND
+    if backend == "default":
+        backend = get_default_io_backend()
+    elif isinstance(backend, str):
+        backend = IOBackend.new(backend)
+    else:
+        if isinstance(backend, type):
+            backend = backend()
+        assert isinstance(
+            backend, IOBackend
+        ), f"Expected str or IOBackend, got: {backend}"
+    CURRENT_IO_BACKEND = backend
+    return CURRENT_IO_BACKEND
+
+
+@lru_cache(maxsize=1)
+def get_default_io_backend() -> "IOBackend":
+    """
+    Return a composite backend that auto-infers which internal backend can support reading
+    from a given identifier.
+
+    It first looks for special cases that need very specific handling
+    (such as: stdin/stdout redirects, pipes)
+    and tries to match them against relevant IO backends.
+    """
+    # Start with the special cases.
+    backends = [
+        RedirectIOBackend(),
+        PipeIOBackend(),
+        TarAsDirBackend(),
+    ]
+    if MSCIOBackend.is_available():
+        backends.append(MSCIOBackend())
+    if AIStoreIOBackend.is_available():
+        # Try AIStore before other generalist backends,
+        # but only if it's installed and enabled via AIS_ENDPOINT env var.
+        backends.append(AIStoreIOBackend())
+    if SmartOpenIOBackend.is_available():
+        backends.append(SmartOpenIOBackend())
+    backends += [
+        GzipIOBackend(),
+        BuiltinIOBackend(),
+    ]
+    return CompositeIOBackend(backends)
+
+
+class TarAsDirBackend(IOBackend):
+    def open(self, file, mode="r", **kwargs):
+        """
+        Enhanced open() function that supports accessing files inside tar archives
+        using the syntax: /path/to/archive.tar/internal/file.txt
+        """
+        import builtins
+        import tarfile
+
+        file_path = str(file)
+
+        # Check if the path contains a tar file
+        for tar_ext in [".tar", ".tar.gz", ".tar.bz2", ".tar.xz"]:
+            if tar_ext + "/" in file_path:
+                # Split path into tar file and internal path
+                parts = file_path.split(tar_ext + "/", 1)
+                if len(parts) == 2:
+                    tar_path = parts[0] + tar_ext
+                    internal_path = parts[1]
+
+                    # Check if tar file exists
+                    if os.path.exists(tar_path):
+                        try:
+                            # Open tar file and extract the internal file
+                            # with tarfile.open(tar_path, 'r') as tar:
+                            #    return BytesIO(tar.extractfile(internal_path).read())
+                            tar = tarfile.open(tar_path, "r")
+                            return tar.extractfile(internal_path)
+                        except (tarfile.TarError, KeyError) as e:
+                            raise FileNotFoundError(
+                                f"File '{internal_path}' not found in '{tar_path}': {e}"
+                            )
+                    else:
+                        raise FileNotFoundError(f"Tar file '{tar_path}' not found")
+
+        # Fall back to regular open() for non-tar paths
+        return builtins.open(file, mode, **kwargs)
+
+    def handles_special_case(self, identifier: Pathlike) -> bool:
+        identifier = str(identifier)
+        for tar_ext in [".tar", ".tar.gz", ".tar.bz2", ".tar.xz"]:
+            if tar_ext + "/" in identifier:
+                return True
+        return False
+
+    def is_applicable(self, identifier: Pathlike) -> bool:
+        return self.handles_special_case(identifier)

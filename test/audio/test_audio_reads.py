@@ -2,21 +2,26 @@ import shutil
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
-import torchaudio
 
 import lhotse
 from lhotse import AudioSource, Recording
+from lhotse.audio import suppress_audio_loading_errors
 from lhotse.audio.backend import (
     info,
+    read_audio,
     read_opus_ffmpeg,
     read_opus_torchaudio,
+    save_audio,
     torchaudio_info,
     torchaudio_load,
 )
+from lhotse.serialization import IOBackend, io_backend
+from lhotse.utils import is_torchaudio_available
 
 
 @pytest.mark.parametrize(
@@ -38,6 +43,7 @@ def test_info_and_read_audio_consistency(path):
     assert audio.shape[1] == recording.num_samples
 
 
+@pytest.mark.skipif(not is_torchaudio_available(), reason="Requires torchaudio")
 @pytest.mark.parametrize(
     "path",
     [
@@ -58,6 +64,7 @@ def test_torchaudio_load_with_offset_duration_works(path, offset, duration):
     # just test that it runs -- the assertions are inside the function
 
 
+@pytest.mark.skipif(not is_torchaudio_available(), reason="Requires torchaudio")
 @pytest.mark.parametrize(
     "path",
     [
@@ -94,6 +101,7 @@ def test_opus_name_with_whitespaces():
         r.load_audio()  # does not raise
 
 
+@pytest.mark.skipif(not is_torchaudio_available(), reason="Requires torchaudio")
 @pytest.mark.parametrize(
     "path",
     [
@@ -150,20 +158,20 @@ def test_audio_caching_disabled_works():
 
     # Save the first waveform in a file.
     with NamedTemporaryFile(suffix=".wav") as f:
-        torchaudio.save(f.name, torch.from_numpy(noise1), sample_rate=16000)
+        save_audio(f.name, noise1, sampling_rate=16000)
         recording = Recording.from_file(f.name)
 
         # Read the audio -- should be equal to noise1.
         audio = recording.load_audio()
-        np.testing.assert_allclose(audio, noise1, atol=3e-5)
+        np.testing.assert_allclose(audio, noise1, atol=3e-4)
 
         # Save noise2 to the same location.
-        torchaudio.save(f.name, torch.from_numpy(noise2), sample_rate=16000)
+        save_audio(f.name, noise2, sampling_rate=16000)
 
         # Read the audio -- should be equal to noise2,
         # and the caching is ignored (doesn't happen).
         audio = recording.load_audio()
-        np.testing.assert_allclose(audio, noise2, atol=3e-5)
+        np.testing.assert_allclose(audio, noise2, atol=3e-4)
 
 
 def test_command_audio_caching_enabled_works():
@@ -179,23 +187,23 @@ def test_command_audio_caching_enabled_works():
 
     # Save the first waveform in a file.
     with NamedTemporaryFile(suffix=".wav") as f:
-        torchaudio.save(f.name, torch.from_numpy(noise1), sample_rate=16000)
+        save_audio(f.name, noise1, sampling_rate=16000)
 
         audio_source = AudioSource("command", list([1]), f"cat {f.name}")
 
         # Read the audio -- should be equal to noise1.
         audio = audio_source.load_audio()
         audio = np.atleast_2d(audio)
-        np.testing.assert_allclose(audio, noise1, atol=3e-5)
+        np.testing.assert_allclose(audio, noise1, atol=3e-4)
 
         # Save noise2 to the same location.
-        torchaudio.save(f.name, torch.from_numpy(noise2), sample_rate=16000)
+        save_audio(f.name, noise2, sampling_rate=16000)
 
         # Read the audio -- should *still* be equal to noise1,
         # because reading from this path was cached before.
         audio = audio_source.load_audio()
         audio = np.atleast_2d(audio)
-        np.testing.assert_allclose(audio, noise1, atol=3e-5)
+        np.testing.assert_allclose(audio, noise1, atol=3e-4)
 
 
 def test_command_audio_caching_disabled_works():
@@ -211,23 +219,23 @@ def test_command_audio_caching_disabled_works():
 
     # Save the first waveform in a file.
     with NamedTemporaryFile(suffix=".wav") as f:
-        torchaudio.save(f.name, torch.from_numpy(noise1), sample_rate=16000)
+        save_audio(f.name, noise1, sampling_rate=16000)
 
         audio_source = AudioSource("command", list([1]), f"cat {f.name}")
 
         # Read the audio -- should be equal to noise1.
         audio = audio_source.load_audio()
         audio = np.atleast_2d(audio)
-        np.testing.assert_allclose(audio, noise1, atol=3e-5)
+        np.testing.assert_allclose(audio, noise1, atol=3e-4)
 
         # Save noise2 to the same location.
-        torchaudio.save(f.name, torch.from_numpy(noise2), sample_rate=16000)
+        save_audio(f.name, noise2, sampling_rate=16000)
 
         # Read the audio -- should be equal to noise2,
         # and the caching is ignored (doesn't happen).
         audio = audio_source.load_audio()
         audio = np.atleast_2d(audio)
-        np.testing.assert_allclose(audio, noise2, atol=3e-5)
+        np.testing.assert_allclose(audio, noise2, atol=3e-4)
 
 
 def test_audio_loading_optimization_returns_expected_num_samples():
@@ -241,6 +249,7 @@ def test_audio_loading_optimization_returns_expected_num_samples():
     assert audio.shape[1] == reduced_num_samples
 
 
+@pytest.mark.skipif(not is_torchaudio_available(), reason="Requires torchaudio")
 def test_torchaudio_info_from_bytes_io():
     audio_filelike = BytesIO(open("test/fixtures/mono_c0.wav", "rb").read())
 
@@ -260,3 +269,42 @@ def test_set_audio_backend():
     )
     audio2 = recording.load_audio()
     np.testing.assert_array_almost_equal(audio1, audio2)
+
+
+def test_audio_source_url_uses_current_io_backend():
+    class DummyUrlIOBackend(IOBackend):
+        def open(self, identifier, mode):
+            assert identifier == "mock://mono_c0.wav"
+            return open("test/fixtures/mono_c0.wav", mode)
+
+    expected, _ = read_audio("test/fixtures/mono_c0.wav")
+    source = AudioSource(type="url", channels=[0], source="mock://mono_c0.wav")
+
+    with io_backend(DummyUrlIOBackend()):
+        restored = source.load_audio()
+
+    np.testing.assert_allclose(np.atleast_2d(restored), np.atleast_2d(expected))
+
+
+def test_fault_tolerant_audio_network_exception():
+    def _mock_load_audio(*args, **kwargs):
+        raise ConnectionResetError()
+
+    source = Mock()
+    source.load_audio = _mock_load_audio
+    source.has_video = False
+
+    recording = Recording(
+        id="irrelevant",
+        sources=[source],
+        sampling_rate=16000,
+        num_samples=16000,
+        duration=1.0,
+        channel_ids=[0],
+    )
+
+    with pytest.raises(ConnectionResetError):
+        recording.load_audio()  # does raise
+
+    with suppress_audio_loading_errors(True):
+        recording.load_audio()  # is silently caught

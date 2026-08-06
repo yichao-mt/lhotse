@@ -16,7 +16,8 @@
 
 # Lhotse
 
-Lhotse is a Python library aiming to make speech and audio data preparation flexible and accessible to a wider community. Alongside [k2](https://github.com/k2-fsa/k2), it is a part of the next generation [Kaldi](https://github.com/kaldi-asr/kaldi) speech processing library.
+Lhotse is a Python library aiming to make multimodal (speech, audio, video, image, text) data preparation flexible and accessible to a wider community.
+Alongside [k2](https://github.com/k2-fsa/k2), it is a part of the next generation [Kaldi](https://github.com/kaldi-asr/kaldi) speech processing library.
 
 ## Tutorial presentations and materials
 
@@ -26,23 +27,25 @@ Lhotse is a Python library aiming to make speech and audio data preparation flex
 
 ## About
 
-### Main goals
+### Main goals (updated for 2025)
 
-- Attract a wider community to speech processing tasks with a **Python-centric design**.
-- Accommodate experienced Kaldi users with an **expressive command-line interface**.
+- Scale to multimodal data pipelines including audio, text, image, and video modalities.
+- Provide state-of-the-art dataloading algorithms such as dataset blending and efficient on-the-fly bucketing.
+- Handle data randomization (or de-duplication) for distributed multi-node training.
+- Attract a wider community to multimodal processing tasks with a **Python-centric design**.
 - Provide **standard data preparation recipes** for commonly used corpora.
-- Provide **PyTorch Dataset classes** for speech and audio related tasks.
-- Flexible data preparation for model training with the notion of **audio cuts**.
-- **Efficiency**, especially in terms of I/O bandwidth and storage capacity.
+- Flexible data preparation for model training with the notion of **audio/video cuts**.
+- Support for efficient sequential I/O data formats such as Lhotse Shar (similar to webdataset).
 
 ### Tutorials
 
-We currently have the following tutorials available in `examples` directory:
+We offer the following tutorials available in `examples` directory:
 - Basic complete Lhotse workflow [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/00-basic-workflow.ipynb)
 - Transforming data with Cuts [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/01-cut-python-api.ipynb)
 - WebDataset integration [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/02-webdataset-integration.ipynb)
 - How to combine multiple datasets [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/03-combining-datasets.ipynb)
 - Lhotse Shar: storage format optimized for sequential I/O and modularity [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/04-lhotse-shar.ipynb)
+- Image and Video Support in Lhotse [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/05-image-and-video-loading.ipynb)
 
 ### Examples of use
 
@@ -60,15 +63,16 @@ exposed to the user through convenient Python classes.
 
 Lhotse introduces the notion of audio cuts, designed to ease the training data construction with operations such as
 mixing, truncation and padding that are performed on-the-fly to minimize the amount of storage required. Data
-augmentation and feature extraction are supported both in pre-computed mode, with highly-compressed feature matrices
-stored on disk, and on-the-fly mode that computes the transformations upon request. Additionally, Lhotse introduces
-feature-space cut mixing to make the best of both worlds.
+augmentation and feature extraction are supported both in pre-computed mode, with feature matrices stored on disk
+(optionally using lilcom-compressed backends for better storage efficiency), and on-the-fly mode that computes the
+transformations upon request. Additionally, Lhotse introduces feature-space cut mixing to make the best of both
+worlds.
 
 ![image](https://raw.githubusercontent.com/lhotse-speech/lhotse/master/docs/lhotse-cut-illustration.png)
 
 ## Installation
 
-Lhotse supports Python version 3.7 and later.
+Lhotse supports Python version 3.10 and later.
 
 ### Pip
 
@@ -105,18 +109,29 @@ Lhotse uses several environment variables to customize it's behavior. They are a
 - `LHOTSE_REQUIRE_TORCHAUDIO` - when it's set and not any of `1|True|true|yes`, we'll not check for torchaudio being installed and remove it from the requirements. It will disable many functionalities of Lhotse but the basic capabilities will remain (including reading audio with `soundfile`).
 - `LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE` - used when we load audio from a file and receive a different number of samples than declared in `Recording.num_samples`. This is sometimes necessary because different codecs (or even different versions of the same codec) may use different padding when decoding compressed audio. Typically values up to 0.1, or even 0.3 (second) are still reasonable, and anything beyond that indicates a serious issue.
 - `LHOTSE_AUDIO_BACKEND` - may be set to any of the values returned from CLI `lhotse list-audio-backends` to override the default behavior of trial-and-error and always use a specific audio backend.
+- `LHOTSE_IO_BACKEND` - may be set to any of the values returned from CLI `lhotse list-io-backends` to override how Lhotse opens paths, URLs, and URIs via `open_best()` (for example when reading manifests or URL-backed `AudioSource`s). The same list is also available in Python via `lhotse.available_io_backends()`.
+- `LHOTSE_RESAMPLING_BACKEND` - may be set to any of the value returned from CLI `lhotse list-resampling-backends` to override the default behaviour.
+- `LHOTSE_FEATURES_STORAGE_BACKEND` - may be set to any valid feature storage backend name (e.g. `numpy_files`, `lilcom_chunky`) to override the default feature storage backend (which is `numpy_files`). Use `lhotse.available_storage_backends()` to inspect the currently usable choices, or `lhotse.storage_backend_statuses()` / CLI `lhotse list-storage-backends` for a full list that also marks unavailable backends with install hints. If you have `lilcom` installed and want smaller feature archives, `lilcom_chunky` is the preferred choice.
 - `LHOTSE_AUDIO_LOADING_EXCEPTION_VERBOSE` - when set to `1` we'll emit full exception stack traces when every available audio backend fails to load a given file (they might be very large).
 - `LHOTSE_DILL_ENABLED` - when it's set to `1|True|true|yes`, we will enable `dill`-based serialization of `CutSet` and `Sampler` across processes (it's disabled by default even when `dill` is installed).
 - `LHOTSE_LEGACY_OPUS_LOADING` - (`=1`) reverts to a legacy OPUS loading mechanism that triggered a new ffmpeg subprocess for each OPUS file.
 - `LHOTSE_PREPARING_RELEASE` - used internally by developers when releasing a new version of Lhotse.
 - `TORCHAUDIO_USE_BACKEND_DISPATCHER` - when set to `1` and torchaudio version is below 2.1, we'll enable the experimental ffmpeg backend of torchaudio.
 - `AIS_ENDPOINT` is read by AIStore client to determine AIStore endpoint URL. Required for AIStore dataloading.
+- `AIS_CONNECT_TIMEOUT` - used by AIStore SDK to set the connection timeout (in seconds) for AIStore client requests. Set to `0` to disable (no timeout). If not set, the SDK default is used (3s).
+- `AIS_READ_TIMEOUT` - used by AIStore SDK to set the read timeout (in seconds) for AIStore client requests. Set to `0` to disable (no timeout). If not set, the SDK default is used (20s).
 - `RANK`, `WORLD_SIZE`, `WORKER`, and `NUM_WORKERS` are internally used to inform Lhotse Shar dataloading subprocesses.
 - `READTHEDOCS` is internally used for documentation builds.
+- `LHOTSE_MSC_OVERRIDE_PROTOCOLS` - when set, it will override your input protocols before feeding to MSCIOBackend.  Useful when you don't want to change your existing url format but want to use MSCIOBackend.  For example, if you have `s3://s3-bucket/path/to/my/object` and `gs://gs-bucket/path/to/my/object`, you can set `LHOTSE_MSC_OVERRIDE_PROTOCOLS=s3,gs` to override the urls to `msc://s3-bucket/path/to/my/object` and `msc://gs-bucket/path/to/my/object`.
+- `LHOTSE_MSC_PROFILE` - when set, it will override the your bucket name before feeding to MSCIOBackend.  Useful when your msc profile is not the same as your bucket name.  For example, if you have `s3://s3-bucket/path/to/my/object`, you can set `LHOTSE_MSC_OVERRIDE_PROTOCOLS=s3` and `LHOTSE_MSC_PROFILE=msc-s3-profile` to override the url to `msc://msc-s3-profile/path/to/my/object`.
+- `LHOTSE_MSC_BACKEND_FORCED` - when set to `True`, forces Lhotse to use MSCIOBackend for all URLs. Use with caution as functionality may break if MSC does not support the provided URL format.
 
 ### Optional dependencies
 
-**Other pip packages.** You can leverage optional features of Lhotse by installing the relevant supporting package like this: `pip install lhotse[package_name]`. The supported optional packages include:
+**Other pip packages.** You can leverage optional features of Lhotse by installing the relevant supporting package:
+- `pip install lhotse[lilcom]` to enable lilcom-compressed feature and array storage backends. If storage efficiency is important, `lilcom_chunky` is the preferred feature-storage backend once this dependency is installed.
+- `torchcodec` (>= 0.9, requires torch >= 2.9) is supported as an audio backend when detected. It is a PyTorch-native audio decoder built on FFmpeg. Install it via `pip install torchcodec`. When installed, it takes precedence over torchaudio in the default backend chain.
+- `torchaudio` used to be a core dependency in Lhotse, but is now optional. Refer to [official PyTorch documentation for installation](https://pytorch.org/get-started/locally/).
 - `pip install lhotse[kaldi]` for a maximal feature set related to Kaldi compatibility. It includes libraries such as `kaldi_native_io` (a more efficient variant of `kaldi_io`) and `kaldifeat` that port some of Kaldi functionality into Python.
 - `pip install lhotse[orjson]` for up to 50% faster reading of JSONL manifests.
 - `pip install lhotse[webdataset]`. We support "compiling" your data into WebDataset tarball format for more effective IO. You can still interact with the data as if it was a regular lazy CutSet. To learn more, check out the following tutorial: [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhotse-speech/lhotse/blob/master/examples/02-webdataset-integration.ipynb)
@@ -125,6 +140,7 @@ Lhotse uses several environment variables to customize it's behavior. They are a
 - `pip install aistore` to read manifests, tar fles, and other data from AIStore using AIStore-supported URLs (set `AIS_ENDPOINT` environment variable to activate it). See [AIStore documentation](https://aiatscale.org) for more details.
 - `pip install smart_open` to read and write manifests and data in any location supported by `smart_open` (e.g. cloud, http).
 - `pip install opensmile` for feature extraction using the OpenSmile toolkit's Python wrapper.
+- `pip install multi-storage-client` for read and write manifests and data in different storage backends. See [multi-storage-client](https://github.com/NVIDIA/multi-storage-client) for more details.
 
 **sph2pipe.** For reading older LDC SPHERE (.sph) audio files that are compressed with codecs unsupported by ffmpeg and sox, please run:
 
@@ -186,3 +202,7 @@ The `VadDataset` will yield a batch with pairs of feature and supervision tensor
 starts roughly at the first second (100 frames):
 
 ![image](https://raw.githubusercontent.com/lhotse-speech/lhotse/master/docs/vad_sample.png)
+
+# Acknowledgment
+
+Some contributions to this project were supported by National Science Foundation CCRI award 2120435.

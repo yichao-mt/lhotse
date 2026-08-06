@@ -1,3 +1,4 @@
+import hashlib
 import itertools
 import logging
 import pickle
@@ -35,23 +36,33 @@ from lhotse.audio import RecordingSet, null_result_on_audio_loading_error
 from lhotse.augmentation import AugmentFn
 from lhotse.cut.base import Cut
 from lhotse.cut.data import DataCut
-from lhotse.cut.mixed import MixedCut, MixTrack
+from lhotse.cut.mixed import MixedCut, MixTrack, _ensure_explicit_snr_reference
 from lhotse.cut.mono import MonoCut
 from lhotse.cut.multi import MultiCut
 from lhotse.cut.padding import PaddingCut
 from lhotse.features import FeatureExtractor, Features, FeatureSet
 from lhotse.features.base import StatsAccumulator, compute_global_stats
-from lhotse.features.io import FeaturesWriter, LilcomChunkyWriter
+from lhotse.features.io import (
+    FeaturesWriter,
+    LilcomChunkyWriter,
+    default_features_storage_backend,
+)
 from lhotse.lazy import (
     AlgorithmMixin,
-    Dillable,
-    LazyFilter,
+    IteratorNode,
     LazyFlattener,
     LazyIteratorChain,
     LazyManifestIterator,
     LazyMapper,
     LazySlicer,
     T,
+    _try_collect_child_state,
+    _try_restore_child_state,
+    attach_graph_origin,
+    get_graph_origin,
+    normalize_graph_token,
+    resolve_iterator_source,
+    supports_graph_restore,
 )
 from lhotse.serialization import Serializable
 from lhotse.supervision import SupervisionSegment, SupervisionSet
@@ -63,7 +74,6 @@ from lhotse.utils import (
     Seconds,
     compute_num_frames,
     compute_num_samples,
-    deprecated,
     exactly_one_not_null,
     fastcopy,
     ifnone,
@@ -240,6 +250,9 @@ class CutSet(Serializable, AlgorithmMixin):
 
         >>> from lhotse import Fbank
         >>> cuts = CutSet()
+        >>> # This uses the default backend (numpy_files unless overridden with
+        >>> # LHOTSE_FEATURES_STORAGE_BACKEND). If lilcom is installed, prefer
+        >>> # storage_type=LilcomChunkyWriter for better storage efficiency.
         >>> cuts = cuts.compute_and_store_features(
         ...     extractor=Fbank(),
         ...     storage_path='/data/feats',
@@ -287,7 +300,11 @@ class CutSet(Serializable, AlgorithmMixin):
 
     @staticmethod
     def from_files(
-        paths: List[Pathlike], shuffle_iters: bool = True, seed: Optional[int] = None
+        paths: List[Pathlike],
+        shuffle_iters: bool = True,
+        seed: Optional[int] = None,
+        indexed: Optional[bool] = None,
+        index_path: Optional[List[Pathlike]] = None,
     ) -> "CutSet":
         """
         Constructor that creates a single CutSet out of many manifest files.
@@ -297,17 +314,54 @@ class CutSet(Serializable, AlgorithmMixin):
         This is intended primarily for large datasets which are split into many small manifests,
         to ensure that the order in which data is seen during training can be properly randomized.
 
+        When ``shuffle_iters=True`` and all files are indexed (i.e. backed by
+        O(1) random-access readers), the shuffling is automatically upgraded
+        from shard-level to item-level: a Feistel-cipher permutation over the
+        combined index range produces true cross-file-boundary shuffled
+        iteration.
+
         :param paths: a list of paths to cut manifests.
-        :param shuffle_iters: bool, should we shuffle `paths` each time we iterate the returned
-            CutSet (enabled by default).
+        :param shuffle_iters: bool, should we shuffle each time we iterate the
+            returned CutSet (enabled by default).  For non-indexed files this
+            shuffles the file order; for indexed files this shuffles globally
+            across file boundaries.
         :param seed: int, random seed controlling the shuffling RNG.
             By default, we'll use Python's global RNG so the order
             will be different on each script execution.
+        :param indexed: controls whether to use indexed random-access reading
+            for each JSONL file.  ``True`` forces indexed mode (requires
+            uncompressed ``.jsonl``).  ``False`` uses the default lazy reader.
+            ``None`` (default) auto-detects: uses indexed mode when a ``.idx``
+            file already exists alongside each JSONL file.
+        :param index_path: optional list of custom ``.idx`` file paths,
+            one per path in *paths*.  When an entry is not ``None`` and
+            ``indexed`` is ``None``, auto-detection resolves to ``True``
+            for that file.
         :return: a lazy CutSet instance.
         """
+        from lhotse.indexing import index_exists
+        from lhotse.lazy import LazyIndexedManifestIterator
+        from lhotse.serialization import extension_contains
+
+        if index_path is not None and len(index_path) != len(paths):
+            raise ValueError(
+                f"index_path has {len(index_path)} entries but paths has "
+                f"{len(paths)} entries — they must match."
+            )
+
+        def _make_iter(i, p):
+            ip = index_path[i] if index_path is not None else None
+            if indexed is True or (indexed is None and ip is not None):
+                return LazyIndexedManifestIterator(p, index_path=ip)
+            elif indexed is None:
+                use_idx = not extension_contains(".gz", p) and index_exists(p)
+                if use_idx:
+                    return LazyIndexedManifestIterator(p)
+            return LazyManifestIterator(p)
+
         return CutSet(
             LazyIteratorChain(
-                *(LazyManifestIterator(p) for p in paths),
+                *(_make_iter(i, p) for i, p in enumerate(paths)),
                 shuffle_iters=shuffle_iters,
                 seed=seed,
             )
@@ -433,8 +487,12 @@ class CutSet(Serializable, AlgorithmMixin):
         split_for_dataloading: bool = False,
         shuffle_shards: bool = False,
         stateful_shuffle: bool = True,
-        seed: Union[int, Literal["randomized"]] = 42,
+        seed: Union[int, Literal["randomized"], Literal["trng"]] = 42,
         cut_map_fns: Optional[Sequence[Callable[[Cut], Cut]]] = None,
+        slice_length: Optional[int] = None,
+        indexed: Optional[bool] = None,
+        index_path=None,
+        indexes_root: Optional[Pathlike] = None,
     ) -> "CutSet":
         """
         Reads cuts and their corresponding data from multiple shards,
@@ -544,19 +602,81 @@ class CutSet(Serializable, AlgorithmMixin):
             ``trng`` mode is mostly useful when the user has limited control over the training loop
             and may not be able to guarantee internal Shar epoch is being incremented, but needs
             randomness on each iteration (e.g. useful with PyTorch Lightning).
-        :param stateful_shuffle: bool, by default ``False``. When ``True``, every
+        :param stateful_shuffle: bool, by default ``True``. When ``True``, every
             time this object is fully iterated, it increments an internal epoch counter
             and triggers shard reshuffling with RNG seeded by ``seed`` + ``epoch``.
             Doesn't have any effect when ``shuffle_shards`` is ``False``.
+            Only applies to streaming mode (``indexed=False``).
         :param cut_map_fns: optional sequence of callables that accept cuts and return cuts.
             It's expected to have the same length as the number of shards, so each function
             corresponds to a specific shard.
             It can be used to attach shard-specific custom attributes to cuts.
+        :param slice_length: optional int, when set enables random slicing of shards that
+            may improve sampling randomness for many-dataset-with-many-large-shards setups
+            at the cost of efficiency. In this mode, we randomly select K to skip first K examples
+            and read only ``slice_length`` examples from each shard, then move to the next one.
+        :param indexed: optional bool. If ``True``, uses
+            :class:`~lhotse.shar.readers.lazy.LazyIndexedSharIterator` for O(1)
+            random access (requires uncompressed indexed Shar shards for every
+            requested field).
+            If ``False``, uses the streaming :class:`~lhotse.shar.readers.lazy.LazySharIterator`.
+            If ``None`` (default), auto-detects: uses indexed mode when every
+            requested field is readable through indexed readers and has a matching
+            ``.idx`` file.
+        :param index_path: optional location of ``.idx`` files stored
+            separately from the data.  Accepts a directory path (when
+            ``in_dir`` is used) or a dict mapping field names to lists
+            of ``.idx`` paths (when ``fields`` is used).  When set and
+            ``indexed`` is ``None``, auto-detection checks the provided
+            index paths for every requested field.
 
         See also: :class:`~lhotse.shar.readers.lazy.LazySharIterator`,
+            :class:`~lhotse.shar.readers.lazy.LazyIndexedSharIterator`,
             :meth:`~lhotse.cut.set.CutSet.to_shar`.
         """
-        from lhotse.shar import LazySharIterator
+        from lhotse.shar.readers.indexed import LazyIndexedSharIterator
+        from lhotse.shar.readers.lazy import LazySharIterator
+
+        use_indexed = indexed
+
+        if (index_path is not None or indexes_root is not None) and indexed is False:
+            raise ValueError(
+                "index_path/indexes_root is set but indexed=False — this is contradictory. "
+                "Either set indexed=True (or None) or remove index_path/indexes_root."
+            )
+
+        if use_indexed is None:
+            use_indexed = LazyIndexedSharIterator.supports_configuration(
+                fields=fields,
+                in_dir=in_dir,
+                index_path=index_path,
+                indexes_root=indexes_root,
+            )
+
+        if use_indexed:
+            # Validate that streaming-only params are not set.
+            if cut_map_fns:
+                raise ValueError(
+                    "'cut_map_fns' is not supported with indexed=True. "
+                    "Use indexed=False for streaming mode."
+                )
+            if slice_length is not None:
+                raise ValueError(
+                    "'slice_length' is not supported with indexed=True. "
+                    "Use indexed=False for streaming mode."
+                )
+
+            return CutSet(
+                cuts=LazyIndexedSharIterator(
+                    fields=fields,
+                    in_dir=in_dir,
+                    shuffle=shuffle_shards,
+                    seed=seed,
+                    split_for_dataloading=split_for_dataloading,
+                    index_path=index_path,
+                    indexes_root=indexes_root,
+                )
+            )
 
         return CutSet(
             cuts=LazySharIterator(
@@ -567,6 +687,7 @@ class CutSet(Serializable, AlgorithmMixin):
                 stateful_shuffle=stateful_shuffle,
                 seed=seed,
                 cut_map_fns=cut_map_fns,
+                slice_length=slice_length,
             )
         )
 
@@ -575,11 +696,14 @@ class CutSet(Serializable, AlgorithmMixin):
         output_dir: Pathlike,
         fields: Dict[str, str],
         shard_size: Optional[int] = 1000,
+        shard_offset: int = 0,
         warn_unused_fields: bool = True,
         include_cuts: bool = True,
         num_jobs: int = 1,
         fault_tolerant: bool = False,
         verbose: bool = False,
+        compress_jsonl: bool = True,
+        create_index: bool = True,
     ) -> Dict[str, List[str]]:
         """
         Writes cuts and their corresponding data into multiple shards,
@@ -607,9 +731,13 @@ class CutSet(Serializable, AlgorithmMixin):
             ...     "some_dir", shard_size=100, fields={"recording": "mp3", "features": "lilcom"}
             ... )
 
-        It would create a directory ``some_dir`` with files such as ``some_dir/cuts.000000.jsonl.gz``,
-        ``some_dir/recording.000000.tar``, ``some_dir/features.000000.tar``,
-        and then the same names but numbered with ``000001``, etc.
+        By default it creates a directory ``some_dir`` with files such as
+        ``some_dir/cuts.000000.jsonl.gz``, ``some_dir/recording.000000.tar``,
+        ``some_dir/features.000000.tar``, and then the same names but numbered
+        with ``000001``, etc. Set ``compress_jsonl=False`` together with
+        ``create_index=True`` to produce fully indexed Shar data that supports
+        exact indexed restore.
+        The starting shard offset can be set using ``shard_offset`` parameter. The writer starts from 0 by default.
         The function returns a dict that maps field names to lists of saved shard paths.
 
         When ``shard_size`` is set to ``None``, we will disable automatic sharding and the
@@ -645,17 +773,24 @@ class CutSet(Serializable, AlgorithmMixin):
                 cuts=self,
                 output_dir=output_dir,
                 shard_size=shard_size,
+                shard_offset=shard_offset,
                 fields=fields,
                 warn_unused_fields=warn_unused_fields,
                 include_cuts=include_cuts,
                 shard_suffix=None,
                 fault_tolerant=fault_tolerant,
                 verbose=verbose,
+                compress_jsonl=compress_jsonl,
+                create_index=create_index,
             )
 
         progbar = partial(tqdm, desc="Shard progress") if verbose else lambda x: x
         shards = self.split_lazy(
-            output_dir=output_dir, chunk_size=shard_size, prefix="cuts", num_digits=6
+            output_dir=output_dir,
+            chunk_size=shard_size,
+            prefix="cuts",
+            num_digits=6,
+            start_idx=shard_offset,
         )
         with ProcessPoolExecutor(num_jobs) as ex:
             futures = []
@@ -667,6 +802,7 @@ class CutSet(Serializable, AlgorithmMixin):
                         cuts=shard,
                         output_dir=output_dir,
                         shard_size=None,  # already sharded
+                        shard_offset=shard_offset,
                         fields=fields,
                         warn_unused_fields=warn_unused_fields,
                         include_cuts=True,
@@ -674,15 +810,17 @@ class CutSet(Serializable, AlgorithmMixin):
                         fault_tolerant=fault_tolerant,
                         verbose=False,
                         preload=True,
+                        compress_jsonl=compress_jsonl,
+                        create_index=create_index,
                     )
                 )
             for f in progbar(as_completed(futures)):
                 partial_paths = f.result()
                 for k, v in partial_paths.items():
-                    output_paths[k].append(v)
+                    output_paths[k].extend(v)
         for k in output_paths:
             output_paths[k] = sorted(output_paths[k])
-        return output_paths
+        return dict(output_paths)
 
     def to_dicts(self) -> Iterable[dict]:
         return (cut.to_dict() for cut in self)
@@ -1061,7 +1199,7 @@ class CutSet(Serializable, AlgorithmMixin):
             return CutSet(
                 LazyFlattener(
                     LazyMapper(
-                        self,
+                        self.data,
                         partial(
                             _trim_to_supervisions_single,
                             keep_overlapping=keep_overlapping,
@@ -1118,7 +1256,7 @@ class CutSet(Serializable, AlgorithmMixin):
             return CutSet(
                 LazyFlattener(
                     LazyMapper(
-                        self,
+                        self.data,
                         partial(
                             _trim_to_alignments_single,
                             type=type,
@@ -1211,7 +1349,7 @@ class CutSet(Serializable, AlgorithmMixin):
             return CutSet(
                 LazyFlattener(
                     LazyMapper(
-                        self,
+                        self.data,
                         partial(
                             _trim_to_supervision_groups_single,
                             max_pause=max_pause,
@@ -1465,7 +1603,7 @@ class CutSet(Serializable, AlgorithmMixin):
             return CutSet(
                 LazyFlattener(
                     LazyMapper(
-                        self,
+                        self.data,
                         partial(
                             _cut_into_windows_single,
                             duration=duration,
@@ -1487,6 +1625,60 @@ class CutSet(Serializable, AlgorithmMixin):
             keep_excessive_supervisions=keep_excessive_supervisions,
         )
         return result
+
+    def cut_into_windows_balanced(
+        self,
+        min_duration: Seconds,
+        max_duration: Seconds,
+        overlap: Seconds = 0.0,
+        keep_excessive_supervisions: bool = True,
+        num_jobs: int = 1,
+    ) -> "CutSet":
+        """
+        Return a new :class:`.CutSet` by splitting every cut into overlapping windows whose
+        duration is chosen in ``[min_duration, max_duration]`` to maximise the last chunk length.
+
+        Each sub-cut has ``custom["source_cut_id"]`` and ``custom["source_cut_start"]`` set so
+        that downstream merging logic can group sub-cuts from the same parent.
+
+        Cuts whose duration is already ``<= max_duration`` are returned unchanged (as a single
+        element in the output stream).
+
+        :param min_duration: Minimum window duration in seconds.
+        :param max_duration: Maximum window duration in seconds.
+        :param overlap: Overlap between consecutive windows in seconds (default: 0).
+        :param keep_excessive_supervisions: Whether to keep supervisions that extend beyond the
+            window boundary.
+        :param num_jobs: Number of parallel workers (default: 1).
+        :return: a new :class:`.CutSet` with overlapping sub-cuts (flat, not grouped).
+        """
+        if num_jobs == 1:
+            return CutSet(
+                LazyFlattener(
+                    LazyMapper(
+                        self,
+                        partial[CutSet](
+                            _cut_into_windows_balanced_single,
+                            min_duration=min_duration,
+                            max_duration=max_duration,
+                            overlap=overlap,
+                            keep_excessive_supervisions=keep_excessive_supervisions,
+                        ),
+                    )
+                )
+            )
+
+        from lhotse.manipulation import split_parallelize_combine
+
+        return split_parallelize_combine(
+            num_jobs,
+            self,
+            _cut_into_windows_balanced_single,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            overlap=overlap,
+            keep_excessive_supervisions=keep_excessive_supervisions,
+        )
 
     def load_audio(
         self,
@@ -1530,7 +1722,12 @@ class CutSet(Serializable, AlgorithmMixin):
             return cuts[0]
         return CutSet(cuts)
 
-    def resample(self, sampling_rate: int, affix_id: bool = False) -> "CutSet":
+    def resample(
+        self,
+        sampling_rate: int,
+        affix_id: bool = False,
+        recording_field: Optional[str] = None,
+    ) -> "CutSet":
         """
         Return a new :class:`~lhotse.cut.CutSet` that contains cuts resampled to the new
         ``sampling_rate``. All cuts in the manifest must contain recording information.
@@ -1539,10 +1736,16 @@ class CutSet(Serializable, AlgorithmMixin):
         :param sampling_rate: The new sampling rate.
         :param affix_id: Should we modify the ID (useful if both versions of the same
             cut are going to be present in a single manifest).
+        :param recording_field: which recording field to resample.
         :return: a modified copy of the ``CutSet``.
         """
         return self.map(
-            partial(_resample, sampling_rate=sampling_rate, affix_id=affix_id)
+            partial(
+                _resample,
+                sampling_rate=sampling_rate,
+                affix_id=affix_id,
+                recording_field=recording_field,
+            )
         )
 
     def perturb_speed(self, factor: float, affix_id: bool = True) -> "CutSet":
@@ -1591,6 +1794,27 @@ class CutSet(Serializable, AlgorithmMixin):
         :return: a modified copy of the ``CutSet``.
         """
         return self.map(partial(_perturb_volume, factor=factor, affix_id=affix_id))
+
+    def narrowband(
+        self, codec: str, restore_orig_sr: bool = True, affix_id: bool = True
+    ) -> "CutSet":
+        """
+        Return a new :class:`~lhotse.cut.CutSet` that contains narrowband effect cuts.
+        It requires the recording manifests to be present.
+        If the feature manifests are attached, they are dropped.
+        The supervision manifests are remaining the same.
+
+        :param codec: Codec name.
+        :param restore_orig_sr: Restore original sampling rate.
+        :param affix_id: Should we modify the ID (useful if both versions of the same
+            cut are going to be present in a single manifest).
+        :return: a modified copy of the ``CutSet``.
+        """
+        return self.map(
+            lambda cut: cut.narrowband(
+                codec=codec, restore_orig_sr=restore_orig_sr, affix_id=affix_id
+            )
+        )
 
     def normalize_loudness(
         self, target: float, mix_first: bool = True, affix_id: bool = True
@@ -1672,6 +1896,7 @@ class CutSet(Serializable, AlgorithmMixin):
         mix_prob: float = 1.0,
         seed: Union[int, Literal["trng", "randomized"], random.Random] = 42,
         random_mix_offset: bool = False,
+        tag: Optional[str] = None,
     ) -> "CutSet":
         """
         Mix cuts in this ``CutSet`` with randomly sampled cuts from another ``CutSet``.
@@ -1703,6 +1928,7 @@ class CutSet(Serializable, AlgorithmMixin):
         :param random_mix_offset: an optional bool.
             When ``True`` and the duration of the to be mixed in cut in longer than the original cut,
              select a random sub-region from the to be mixed in cut.
+        :param tag: Optional label attached to the mixed-in tracks.
         :return: a new ``CutSet`` with mixed cuts.
         """
         return CutSet(
@@ -1716,6 +1942,7 @@ class CutSet(Serializable, AlgorithmMixin):
                 mix_prob=mix_prob,
                 seed=seed,
                 random_mix_offset=random_mix_offset,
+                tag=tag,
             )
         )
 
@@ -1757,7 +1984,7 @@ class CutSet(Serializable, AlgorithmMixin):
         storage_path: Pathlike,
         num_jobs: Optional[int] = None,
         augment_fn: Optional[AugmentFn] = None,
-        storage_type: Type[FW] = LilcomChunkyWriter,
+        storage_type: Optional[Type[FW]] = None,
         executor: Optional[Executor] = None,
         mix_eagerly: bool = True,
         progress_bar: bool = True,
@@ -1766,21 +1993,35 @@ class CutSet(Serializable, AlgorithmMixin):
         Extract features for all cuts, possibly in parallel,
         and store them using the specified storage object.
 
+        When ``storage_type`` is not provided, Lhotse uses the backend selected by
+        ``LHOTSE_FEATURES_STORAGE_BACKEND`` and falls back to ``numpy_files``.
+        If the optional ``lilcom`` dependency is installed, prefer
+        ``LilcomChunkyWriter`` for better storage efficiency.
+        To inspect the currently usable choices, call
+        ``lhotse.available_storage_backends()``. For a full list that also marks
+        unavailable backends with install hints, use
+        ``lhotse.storage_backend_statuses()`` or run
+        ``lhotse list-storage-backends``.
+
         Examples:
 
             Extract fbank features on one machine using 8 processes,
-            store arrays partitioned in 8 archive files with lilcom compression:
+            store arrays partitioned in 8 archive files with lilcom compression
+            (recommended when ``lilcom`` is installed):
 
+            >>> from lhotse import LilcomChunkyWriter
             >>> cuts = CutSet(...)
             ... cuts.compute_and_store_features(
             ...     extractor=Fbank(),
             ...     storage_path='feats',
             ...     num_jobs=8,
+            ...     storage_type=LilcomChunkyWriter,
             ... )
 
             Extract fbank features on one machine using 8 processes,
             store each array in a separate file with lilcom compression:
 
+            >>> from lhotse import LilcomFilesWriter
             >>> cuts = CutSet(...)
             ... cuts.compute_and_store_features(
             ...     extractor=Fbank(),
@@ -1793,12 +2034,14 @@ class CutSet(Serializable, AlgorithmMixin):
             with 80 jobs,
             store arrays partitioned in 80 archive files with lilcom compression:
 
+            >>> from lhotse import LilcomChunkyWriter
             >>> from distributed import Client
             ... cuts = CutSet(...)
             ... cuts.compute_and_store_features(
             ...     extractor=Fbank(),
             ...     storage_path='feats',
             ...     num_jobs=80,
+            ...     storage_type=LilcomChunkyWriter,
             ...     executor=Client(...)
             ... )
 
@@ -1829,6 +2072,9 @@ class CutSet(Serializable, AlgorithmMixin):
         :param storage_type: a ``FeaturesWriter`` subclass type.
             It determines how the features are stored to disk,
             e.g. separate file per array, HDF5 files with multiple arrays, etc.
+            When omitted, Lhotse uses ``LHOTSE_FEATURES_STORAGE_BACKEND`` or
+            ``numpy_files`` by default. If ``lilcom`` is installed,
+            ``LilcomChunkyWriter`` remains the preferred choice for storage efficiency.
         :param executor: when provided, will be used to parallelize the feature extraction process.
             By default, we will instantiate a ProcessPoolExecutor.
             Learn more about the ``Executor`` API at
@@ -1852,6 +2098,7 @@ class CutSet(Serializable, AlgorithmMixin):
         )  # does nothing, unless we overwrite it with an actual prog bar
         if num_jobs is None:
             num_jobs = 1
+        storage_type = ifnone(storage_type, default_features_storage_backend())
         if num_jobs == 1 and executor is not None:
             logging.warning(
                 "Executor argument was passed but num_jobs set to 1: "
@@ -1908,7 +2155,9 @@ class CutSet(Serializable, AlgorithmMixin):
         # Parallel execution: prepare the CutSet splits
         # We use LazySlicer to pick every k element out of n
         # (e.g. with 2 jobs, job 1 picks every 0th elem, job 2 picks every 1st elem)
-        cut_sets = [CutSet(LazySlicer(self, k=i, n=num_jobs)) for i in range(num_jobs)]
+        cut_sets = [
+            CutSet(LazySlicer(self.data, k=i, n=num_jobs)) for i in range(num_jobs)
+        ]
 
         # Initialize the default executor if None was given
         if executor is None:
@@ -1954,7 +2203,7 @@ class CutSet(Serializable, AlgorithmMixin):
         num_workers: int = 4,
         collate: bool = False,
         augment_fn: Optional[AugmentFn] = None,
-        storage_type: Type[FW] = LilcomChunkyWriter,
+        storage_type: Optional[Type[FW]] = None,
         overwrite: bool = False,
     ) -> "CutSet":
         """
@@ -1968,10 +2217,21 @@ class CutSet(Serializable, AlgorithmMixin):
         be much faster than :meth:`.CutSet.compute_and_store_features`.
         Otherwise, the speed will be comparable to single-threaded extraction.
 
+        When ``storage_type`` is not provided, Lhotse uses the backend selected by
+        ``LHOTSE_FEATURES_STORAGE_BACKEND`` and falls back to ``numpy_files``.
+        If the optional ``lilcom`` dependency is installed, prefer
+        ``LilcomChunkyWriter`` for better storage efficiency.
+        To inspect the currently usable choices, call
+        ``lhotse.available_storage_backends()``. For a full list that also marks
+        unavailable backends with install hints, use
+        ``lhotse.storage_backend_statuses()`` or run
+        ``lhotse list-storage-backends``.
+
         Example: extract fbank features on one GPU, using 4 dataloading workers
         for reading audio, and store the arrays in an archive file with
         lilcom compression::
 
+            >>> from lhotse import LilcomChunkyWriter
             >>> from lhotse import KaldifeatFbank, KaldifeatFbankConfig
             >>> extractor = KaldifeatFbank(KaldifeatFbankConfig(device='cuda'))
             >>> cuts = CutSet(...)
@@ -1980,6 +2240,7 @@ class CutSet(Serializable, AlgorithmMixin):
             ...     storage_path='feats',
             ...     batch_duration=500,
             ...     num_workers=4,
+            ...     storage_type=LilcomChunkyWriter,
             ... )
 
         :param extractor: A :class:`~lhotse.features.base.FeatureExtractor` instance,
@@ -2006,18 +2267,25 @@ class CutSet(Serializable, AlgorithmMixin):
         :param storage_type: a ``FeaturesWriter`` subclass type.
             It determines how the features are stored to disk,
             e.g. separate file per array, HDF5 files with multiple arrays, etc.
+            When omitted, Lhotse uses ``LHOTSE_FEATURES_STORAGE_BACKEND`` or
+            ``numpy_files`` by default. If ``lilcom`` is installed,
+            ``LilcomChunkyWriter`` remains the preferred choice for storage efficiency.
         :param overwrite: should we overwrite the manifest, HDF5 files, etc.
             By default, this method will append to these files if they exist.
         :return: Returns a new ``CutSet`` with ``Features`` manifests attached to the cuts.
         """
         from concurrent.futures import ThreadPoolExecutor
 
-        import torch
         from torch.utils.data import DataLoader
 
         from lhotse.dataset import SimpleCutSampler, UnsupervisedWaveformDataset
         from lhotse.qa import validate_features
 
+        storage_type = ifnone(storage_type, default_features_storage_backend())
+        if storage_type.name == "numpy_files":
+            storage_path = Path(storage_path)
+            if storage_path.exists() and storage_path.is_file():
+                storage_path = storage_path.with_name(f"{storage_path.name}_storage")
         frame_shift = extractor.frame_shift
 
         # We're opening a sequential cuts writer that can resume previously interrupted
@@ -2132,6 +2400,9 @@ class CutSet(Serializable, AlgorithmMixin):
                 futures.append(executor.submit(_save_worker, cuts, features))
                 progress.update(len(cuts))
 
+        for future in futures:
+            future.result()
+
         # If ``manifest_path`` was provided, this is a lazy manifest;
         # otherwise everything is in memory.
         return cuts_writer.open_manifest()
@@ -2206,9 +2477,7 @@ class CutSet(Serializable, AlgorithmMixin):
         # Non-parallel execution
         if executor is None and num_jobs == 1:
             if progress_bar:
-                progress = partial(
-                    tqdm, desc="Storing audio recordings", total=len(self)
-                )
+                progress = partial(tqdm, desc="Storing audio recordings")
             return CutSet(
                 progress(
                     cut.save_audio(
@@ -2340,7 +2609,7 @@ class CutSet(Serializable, AlgorithmMixin):
         |   └── field2
         |       ├── arr2-1.npy
         |       └── ...
-        ├── features.lca
+        ├── features.lca or features/
         └── cuts.jsonl.gz
 
         :param output_dir: The root directory where we'll store the copied data.
@@ -2353,7 +2622,12 @@ class CutSet(Serializable, AlgorithmMixin):
         output_dir = Path(output_dir)
         audio_dir = output_dir / "audio"
         audio_dir.mkdir(exist_ok=True, parents=True)
-        feature_file = output_dir / "features.lca"
+        feature_writer_type = default_features_storage_backend()
+        if feature_writer_type is LilcomChunkyWriter:
+            feature_storage = output_dir / "features.lca"
+        else:
+            feature_storage = output_dir / "features"
+            feature_storage.mkdir(exist_ok=True, parents=True)
         custom_dir = output_dir / "custom"
         custom_dir.mkdir(exist_ok=True, parents=True)
 
@@ -2363,7 +2637,7 @@ class CutSet(Serializable, AlgorithmMixin):
 
         with CutSet.open_writer(
             output_dir / "cuts.jsonl.gz"
-        ) as manifest_writer, LilcomChunkyWriter(feature_file) as feature_writer:
+        ) as manifest_writer, feature_writer_type(feature_storage) as feature_writer:
 
             def _copy_single(cut):
                 cut = fastcopy(cut)
@@ -2502,6 +2776,212 @@ class CutSet(Serializable, AlgorithmMixin):
             partial(_transform_text, transform_fn=transform_fn)
         )
 
+    def prefetch(self, buffer_size: int = 10) -> "CutSet":
+        """
+        Pre-fetches the CutSet elements in a background process.
+        Useful for enabling concurrent reading/processing/writing in ETL-style tasks.
+
+        .. caution:: This method internally uses a PyTorch DataLoader with a single worker.
+            It is not suitable for use in typical PyTorch training scripts.
+
+        .. caution:: If you run into pickling issues when using this method, you're also likely
+            using .filter/.map methods with a lambda function.
+            Please set ``lhotse.set_dill_enabled(True)`` to resolve these issues, or convert lambdas
+            to regular functions + ``functools.partial``
+
+        """
+        from torch.utils.data import DataLoader
+
+        from lhotse.dataset import DynamicCutSampler, IterableDatasetWrapper
+
+        return CutSet(
+            DataLoader(
+                dataset=IterableDatasetWrapper(
+                    _BackgroundCutFetcher(),
+                    DynamicCutSampler(self, max_cuts=1, rank=0, world_size=1),
+                ),
+                batch_size=None,
+                num_workers=1,
+                prefetch_factor=buffer_size,
+            )
+        )
+
+    def to_huggingface_dataset(self):
+        """
+        Converts a CutSet to a HuggingFace Dataset. Currently, only MonoCut with one recording source is supported.
+        Other cut types will be supported in the future.
+
+        Currently, two formats are supported:
+            1. If each cut has one supervision (e.g. LibriSpeech), each cut is represented as a single row (entry)
+               in the HuggingFace dataset with all the supervision information stored along the cut information.
+               The final HuggingFace dataset format is:
+                   ╔═══════════════════╦═══════════════════════════════╗
+                   ║      Feature      ║            Type               ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║        id         ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║      audio        ║ Audio()                       ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║     duration      ║ Value(dtype='float32')        ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║   num_channels    ║ Value(dtype='uint16')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║       text        ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║     speaker       ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║     language      ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║   {x}_alignment   ║ Sequence(Alignment)           ║
+                   ╚═══════════════════╩═══════════════════════════════╝
+               where x stands for the alignment type (commonly used: "word", "phoneme").
+
+               Alignment is represented as:
+                   ╔═══════════════════╦═══════════════════════════════╗
+                   ║      Feature      ║            Type               ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║      symbol       ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║       start       ║ Value(dtype='float32')        ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║        end        ║ Value(dtype='float32')        ║
+                   ╚═══════════════════╩═══════════════════════════════╝
+
+
+            2. If each cut has multiple supervisions (e.g. AMI), each cut is represented as a single row (entry)
+               while all the supervisions are stored in a separate list of dictionaries under the 'segments' key.
+               The final HuggingFace dataset format is:
+                   ╔══════════════╦════════════════════════════════════╗
+                   ║   Feature    ║                 Type               ║
+                   ╠══════════════╬════════════════════════════════════╣
+                   ║      id      ║ Value(dtype='string')              ║
+                   ╠══════════════╬════════════════════════════════════╣
+                   ║    audio     ║ Audio()                            ║
+                   ╠══════════════╬════════════════════════════════════╣
+                   ║   duration   ║ Value(dtype='float32')             ║
+                   ╠══════════════╬════════════════════════════════════╣
+                   ║ num_channels ║ Value(dtype='uint16')              ║
+                   ╠══════════════╬════════════════════════════════════╣
+                   ║   segments   ║ Sequence(Segment)                  ║
+                   ╚══════════════╩════════════════════════════════════╝
+               where one Segment is represented as:
+                   ╔═══════════════════╦═══════════════════════════════╗
+                   ║      Feature      ║            Type               ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║        text       ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║       start       ║ Value(dtype='float32')        ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║        end        ║ Value(dtype='float32')        ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║      channel      ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║      speaker      ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║      language     ║ Value(dtype='string')         ║
+                   ╠═══════════════════╬═══════════════════════════════╣
+                   ║   {x}_alignment   ║ Sequence(Alignment)           ║
+                   ╚═══════════════════╩═══════════════════════════════╝
+        :return: A HuggingFace Dataset.
+        """
+        from lhotse.hf import export_cuts_to_hf
+
+        return export_cuts_to_hf(self)
+
+    @staticmethod
+    def from_huggingface_dataset(
+        *dataset_args,
+        audio_key: str = "audio",
+        text_key: str = "sentence",
+        lang_key: str = "language",
+        gender_key: str = "gender",
+        **dataset_kwargs,
+    ):
+        """
+        Initializes a Lhotse CutSet from an existing HF dataset,
+        or args/kwargs passed on to ``datasets.load_dataset()``.
+
+        Use ``audio_key``, ``text_key``, ``lang_key`` and ``gender_key`` options to indicate which keys in dict examples
+        returned from HF Dataset should be looked up for audio, transcript, language, and gender respectively.
+        The remaining keys in HF dataset examples will be stored inside ``cut.custom`` dictionary.
+
+        Example with existing HF dataset::
+
+            >>> import datasets
+            ... dataset = datasets.load_dataset("mozilla-foundation/common_voice_11_0", "hi", split="test")
+            ... dataset = dataset.map(some_transform)
+            ... cuts = CutSet.from_huggingface_dataset(dataset)
+            ... for cut in cuts:
+            ...     pass
+
+        Example providing HF dataset init args/kwargs::
+
+            >>> import datasets
+            ... cuts = CutSet.from_huggingface_dataset("mozilla-foundation/common_voice_11_0", "hi", split="test")
+            ... for cut in cuts:
+            ...     pass
+
+        """
+        from lhotse.hf import LazyHFDatasetIterator
+
+        return CutSet(
+            LazyHFDatasetIterator(
+                *dataset_args,
+                audio_key=audio_key,
+                text_key=text_key,
+                lang_key=lang_key,
+                gender_key=gender_key,
+                **dataset_kwargs,
+            )
+        )
+
+    @property
+    def is_indexed(self) -> bool:
+        """
+        Return ``True`` when the underlying iterator is backed by indexed data.
+        """
+        return getattr(self.data, "is_indexed", False)
+
+    @property
+    def has_constant_time_access(self) -> bool:
+        """
+        Return ``True`` when every element can be retrieved in O(1) via
+        ``__getitem__`` (i.e., the underlying data supports indexed access).
+        """
+        return getattr(self.data, "has_constant_time_access", False)
+
+    def state_dict(self) -> dict:
+        """
+        Collect the full checkpoint state from the underlying lazy iterator
+        graph.  Raises :class:`RuntimeError` for eager CutSets.
+
+        See :func:`~lhotse.checkpoint.collect_state_dict`.
+        """
+        if not self.is_lazy:
+            raise RuntimeError(
+                "state_dict() is only supported for lazy CutSets. "
+                "Convert to lazy mode first (e.g., use from_jsonl_lazy or from_file)."
+            )
+        from lhotse.checkpoint import collect_state_dict
+
+        return collect_state_dict(self.data)
+
+    def load_state_dict(self, sd: dict) -> None:
+        """
+        Restore the checkpoint state into the underlying lazy iterator graph.
+        Raises :class:`RuntimeError` for eager CutSets.
+
+        See :func:`~lhotse.checkpoint.restore_state_dict`.
+        """
+        if not self.is_lazy:
+            raise RuntimeError(
+                "load_state_dict() is only supported for lazy CutSets. "
+                "Convert to lazy mode first (e.g., use from_jsonl_lazy or from_file)."
+            )
+        from lhotse.checkpoint import restore_state_dict
+
+        restore_state_dict(self.data, sd)
+
     def __repr__(self) -> str:
         try:
             len_val = len(self)
@@ -2533,6 +3013,12 @@ class CutSet(Serializable, AlgorithmMixin):
         yield from self.cuts
 
 
+class _BackgroundCutFetcher(torch.utils.data.Dataset):
+    def __getitem__(self, cuts: CutSet):
+        assert len(cuts) == 1
+        return cuts[0]
+
+
 def mix(
     reference_cut: Cut,
     mixed_in_cut: Cut,
@@ -2540,6 +3026,7 @@ def mix(
     allow_padding: bool = False,
     snr: Optional[Decibels] = None,
     preserve_id: Optional[str] = None,
+    tag: Optional[str] = None,
 ) -> MixedCut:
     """
     Overlay, or mix, two cuts. Optionally the ``mixed_in_cut`` may be shifted by ``offset`` seconds
@@ -2554,6 +3041,7 @@ def mix(
     :param snr: Desired SNR of the ``right_cut`` w.r.t. the ``left_cut`` in the mix.
     :param preserve_id: optional string ("left", "right"). when specified, append will preserve the cut id
         of the left- or right-hand side argument. otherwise, a new random id is generated.
+    :param tag: Optional label attached to the mixed-in tracks.
     :return: A :class:`~MixedCut` instance.
     """
 
@@ -2628,10 +3116,16 @@ def mix(
     if (
         isinstance(reference_cut, MixedCut)
         and len(ifnone(reference_cut.transforms, [])) == 0
+        and not any(track.mute for track in reference_cut.tracks)
     ):
-        old_tracks = reference_cut.tracks
+        old_tracks = _ensure_explicit_snr_reference(reference_cut.tracks.copy())
     elif isinstance(reference_cut, (DataCut, PaddingCut, MixedCut)):
-        old_tracks = [MixTrack(cut=reference_cut)]
+        old_tracks = [
+            MixTrack(
+                cut=reference_cut,
+                is_snr_reference=not isinstance(reference_cut, PaddingCut),
+            )
+        ]
     else:
         raise ValueError(f"Unsupported type of cut in mix(): {type(reference_cut)}")
 
@@ -2640,8 +3134,10 @@ def mix(
     if isinstance(mixed_in_cut, MixedCut):
         # Similarly for mixed_in_cut, if it is a MixedCut and it does not have existing transforms,
         # take its existing tracks, otherwise create a new track.
-        if len(ifnone(mixed_in_cut.transforms, [])) > 0:
-            new_tracks = [MixTrack(cut=mixed_in_cut, offset=offset, snr=snr)]
+        if len(ifnone(mixed_in_cut.transforms, [])) > 0 or any(
+            track.mute for track in mixed_in_cut.tracks
+        ):
+            new_tracks = [MixTrack(cut=mixed_in_cut, offset=offset, snr=snr, tag=tag)]
         else:
             new_tracks = [
                 MixTrack(
@@ -2661,11 +3157,14 @@ def mix(
                         # When no SNR was specified whatsoever, use none.
                         else None
                     ),
+                    tag=track.tag if track.tag is not None else tag,
+                    is_snr_reference=False,
+                    mute=track.mute,
                 )
                 for track in mixed_in_cut.tracks
             ]
     elif isinstance(mixed_in_cut, (DataCut, PaddingCut)):
-        new_tracks = [MixTrack(cut=mixed_in_cut, offset=offset, snr=snr)]
+        new_tracks = [MixTrack(cut=mixed_in_cut, offset=offset, snr=snr, tag=tag)]
     else:
         raise ValueError(f"Unsupported type of cut in mix(): {type(mixed_in_cut)}")
 
@@ -2685,7 +3184,7 @@ def pad(
     """
     Return a new MixedCut, padded with zeros in the recording, and ``pad_feat_value`` in each feature bin.
 
-    The user can choose to pad either to a specific `duration`; a specific number of frames `max_frames`;
+    The user can choose to pad either to a specific `duration`; a specific number of frames `num_frames`;
     or a specific number of samples `num_samples`. The three arguments are mutually exclusive.
 
     :param cut: DataCut to be padded.
@@ -3236,6 +3735,21 @@ def _cut_into_windows_single(
     ).to_eager()
 
 
+def _cut_into_windows_balanced_single(
+    cuts: CutSet,
+    min_duration,
+    max_duration,
+    overlap,
+    keep_excessive_supervisions,
+) -> CutSet:
+    return cuts.cut_into_windows_balanced(
+        min_duration=min_duration,
+        max_duration=max_duration,
+        overlap=overlap,
+        keep_excessive_supervisions=keep_excessive_supervisions,
+    ).to_eager()
+
+
 def _trim_to_supervisions_single(
     cuts: CutSet,
     keep_overlapping,
@@ -3403,6 +3917,7 @@ def _export_to_shar_single(
     cuts: CutSet,
     output_dir: Pathlike,
     shard_size: Optional[int],
+    shard_offset: int,
     fields: Dict[str, str],
     warn_unused_fields: bool,
     include_cuts: bool,
@@ -3410,6 +3925,8 @@ def _export_to_shar_single(
     verbose: bool,
     fault_tolerant: bool,
     preload: bool = False,
+    compress_jsonl: bool = True,
+    create_index: bool = True,
 ) -> Dict[str, List[str]]:
     from lhotse.shar import SharWriter
 
@@ -3424,9 +3941,12 @@ def _export_to_shar_single(
         output_dir=output_dir,
         fields=fields,
         shard_size=shard_size,
+        shard_offset=shard_offset,
         warn_unused_fields=warn_unused_fields,
         include_cuts=include_cuts,
         shard_suffix=shard_suffix,
+        compress_jsonl=compress_jsonl,
+        create_index=create_index,
     ) as writer:
         for cut in cuts:
             try:
@@ -3434,7 +3954,7 @@ def _export_to_shar_single(
             except Exception as e:
                 if fault_tolerant:
                     logging.warning(
-                        "Skipping: failed to load cut '{cut.id}'. Error message: {e}."
+                        f"Skipping: failed to load cut '{cut.id}'. Error message: {e}."
                     )
                 else:
                     raise
@@ -3444,7 +3964,7 @@ def _export_to_shar_single(
     return writer.output_paths
 
 
-class LazyCutMixer(Dillable):
+class LazyCutMixer(IteratorNode):
     """
     Iterate over cuts from ``cuts`` CutSet while mixing randomly sampled ``mix_in_cuts`` into them.
     A typical application would be data augmentation with noise, music, babble, etc.
@@ -3493,9 +4013,12 @@ class LazyCutMixer(Dillable):
         seed: Union[int, Literal["trng", "randomized"], random.Random] = 42,
         random_mix_offset: bool = False,
         stateful: bool = True,
+        tag: Optional[str] = None,
     ) -> None:
-        self.source = cuts
+        self.source = resolve_iterator_source(cuts)
+        self._source_len_ref = cuts
         self.mix_in_cuts = mix_in_cuts
+        self._mix_in_source = resolve_iterator_source(mix_in_cuts)
         self.duration = duration
         self.allow_padding = allow_padding
         self.snr = snr
@@ -3504,7 +4027,13 @@ class LazyCutMixer(Dillable):
         self.seed = seed
         self.random_mix_offset = random_mix_offset
         self.stateful = stateful
+        self.tag = tag
         self.num_times_iterated = 0
+        self._restored = False
+        self._rng_state = None
+        self._rng = None
+        self._iteration_seed = None
+        self._mix_in_iter = None
 
         assert 0.0 <= self.mix_prob <= 1.0
         assert self.duration is None or self.duration > 0
@@ -3515,91 +4044,233 @@ class LazyCutMixer(Dillable):
         else:
             assert isinstance(self.snr, (type(None), int, float))
 
+    @property
+    def is_checkpointable(self) -> bool:
+        return (
+            self.stateful
+            and self._noise_is_indexed()
+            and isinstance(self.source, IteratorNode)
+            and self.source.is_checkpointable
+        )
+
+    @property
+    def is_indexed(self) -> bool:
+        return getattr(self.source, "is_indexed", False) and getattr(
+            self._mix_in_source, "is_indexed", False
+        )
+
+    @property
+    def has_constant_time_access(self) -> bool:
+        return (
+            not isinstance(self.seed, random.Random)
+            and supports_graph_restore(self.source)
+            and self._noise_is_indexed()
+        )
+
     def __iter__(self):
         from lhotse.dataset.dataloading import resolve_seed
 
-        if isinstance(self.seed, random.Random):
+        restored = self._restored
+        self._restored = False
+
+        if self.has_constant_time_access:
+            if restored:
+                iteration_seed = self._iteration_seed
+                if iteration_seed is None:
+                    iteration_seed = self._resolve_iteration_seed(
+                        self.num_times_iterated
+                    )
+            else:
+                iteration_seed = self._resolve_iteration_seed(self.num_times_iterated)
+                self._iteration_seed = iteration_seed
+
+        if self.has_constant_time_access:
+            rng = None
+        elif restored and self._rng_state is not None:
+            rng = random.Random()
+            rng.setstate(self._rng_state)
+        elif isinstance(self.seed, random.Random):
             rng = self.seed
         else:
             rng = random.Random(resolve_seed(self.seed) + self.num_times_iterated)
-        if self.stateful:
+        self._rng = rng
+
+        if self.stateful and not restored:
             self.num_times_iterated += 1
 
-        if self.mix_in_cuts.is_lazy:
-            # If the noise input is lazy, we'll shuffle it approximately.
-            # We set the shuffling buffer size to 2000 because that's the size of MUSAN,
-            # so even if the user forgets to convert MUSAN to an eager manifest, they will
-            # get roughly the same quality of noise randomness.
-            # Note: we can't just call .to_eager() as the noise CutSet can technically be
-            #       very large, or even hold data in-memory in case of webdataset/Lhotse Shar sources.
-            def noise_gen():
-                yield from self.mix_in_cuts.repeat().shuffle(rng=rng, buffer_size=2000)
+        if not self._noise_is_indexed():
+            if self.mix_in_cuts.is_lazy:
+                # For non-indexed noise we keep the approximate-shuffle behavior.
+                def noise_gen():
+                    yield from self.mix_in_cuts.repeat().shuffle(
+                        rng=rng, buffer_size=2000
+                    )
 
-        else:
-            # Eager nose cuts are just fully reshuffled in a different order on each noise "epoch".
-            def noise_gen():
-                #
-                while True:
-                    yield from self.mix_in_cuts.shuffle(rng=rng)
+            else:
+                # Eager noise cuts are reshuffled every full pass.
+                def noise_gen():
+                    while True:
+                        yield from self.mix_in_cuts.shuffle(rng=rng)
 
-        mix_in_cuts = iter(noise_gen())
+            self._mix_in_iter = iter(noise_gen())
+
         for cut in self.source:
-            # Check whether we're going to mix something into the current cut
-            # or pass it through unchanged.
-            if not is_cut(cut) or rng.uniform(0.0, 1.0) > self.mix_prob:
-                yield cut
-                continue
-            # Determine the SNR - either it's specified or we need to sample one.
-            cut_snr = (
-                rng.uniform(*self.snr)
-                if isinstance(self.snr, (list, tuple))
-                else self.snr
+            if self.has_constant_time_access:
+                source_token = get_graph_origin(cut)
+                if source_token is None:
+                    raise RuntimeError(
+                        "LazyCutMixer requires '_graph_origin' on indexed source items "
+                        "to support constant-time reconstruction."
+                    )
+                item_rng = self._make_item_rng(source_token, iteration_seed)
+                cut = attach_graph_origin(self._mix_one(cut, item_rng), source_token)
+            else:
+                cut = self._mix_one(cut, rng)
+            yield cut
+
+    def _noise_is_indexed(self) -> bool:
+        return getattr(
+            self._mix_in_source, "is_indexed", False
+        ) and supports_graph_restore(self._mix_in_source, require_length=True)
+
+    def _next_mix_in_cut(self, rng: random.Random) -> Cut:
+        if self._noise_is_indexed():
+            idx = rng.randrange(len(self._mix_in_source))
+            return self._mix_in_source[idx]
+        return next(self._mix_in_iter)
+
+    def _resolve_iteration_seed(self, iteration_idx: int) -> int:
+        from lhotse.dataset.dataloading import resolve_seed
+
+        if isinstance(self.seed, random.Random):
+            raise RuntimeError(
+                "LazyCutMixer with seed=random.Random does not support constant-time restore."
             )
-            # Note: we subtract 0.05s (50ms) from the target duration to avoid edge cases
-            #       where we mix in some noise cut that effectively has 0 frames of features.
-            target_mixed_duration = round(
-                self.duration if self.duration is not None else cut.duration - 0.05,
-                ndigits=8,
+        return resolve_seed(self.seed) + iteration_idx
+
+    @staticmethod
+    def _combine_seed(iteration_seed: int, source_token: Any) -> int:
+        token_bytes = pickle.dumps(normalize_graph_token(source_token), protocol=4)
+        token_seed = int.from_bytes(
+            hashlib.blake2b(token_bytes, digest_size=8).digest(), byteorder="little"
+        )
+        return ((iteration_seed * 0x9E3779B97F4A7C15) + token_seed) & 0xFFFFFFFFFFFFFFFF
+
+    def _make_item_rng(self, source_token: Any, iteration_seed: int) -> random.Random:
+        return random.Random(self._combine_seed(iteration_seed, source_token))
+
+    def _mix_one(self, cut: Cut, rng: random.Random) -> Cut:
+        # Check whether we're going to mix something into the current cut
+        # or pass it through unchanged.
+        if not is_cut(cut) or rng.uniform(0.0, 1.0) > self.mix_prob:
+            return cut
+        # Determine the SNR - either it's specified or we need to sample one.
+        cut_snr = (
+            rng.uniform(*self.snr) if isinstance(self.snr, (list, tuple)) else self.snr
+        )
+        # Note: we subtract 0.05s (50ms) from the target duration to avoid edge cases
+        #       where we mix in some noise cut that effectively has 0 frames of features.
+        target_mixed_duration = round(
+            self.duration if self.duration is not None else cut.duration - 0.05,
+            ndigits=8,
+        )
+        # Actual mixing
+        to_mix = self._next_mix_in_cut(rng)
+        to_mix = self._maybe_truncate_cut(to_mix, target_mixed_duration, rng)
+        mixed = cut.mix(
+            other=to_mix, snr=cut_snr, preserve_id=self.preserve_id, tag=self.tag
+        )
+        # Did the user specify a duration?
+        # If yes, we will ensure that shorter cuts have more noise mixed in
+        # to "pad" them with at the end.
+        # If no, we will mix in as many noise cuts as needed to cover complete
+        # duration.
+        mixed_in_duration = to_mix.duration
+        # Keep sampling until we mixed in a "duration" amount of noise.
+        # Note: we subtract 0.05s (50ms) from the target duration to avoid edge cases
+        #       where we mix in some noise cut that effectively has 0 frames of features.
+        while mixed_in_duration < target_mixed_duration - 0.05:
+            to_mix = self._next_mix_in_cut(rng)
+            to_mix = self._maybe_truncate_cut(
+                to_mix, target_mixed_duration - mixed_in_duration, rng
             )
-            # Actual mixing
-            to_mix = next(mix_in_cuts)
-            to_mix = self._maybe_truncate_cut(to_mix, target_mixed_duration, rng)
-            mixed = cut.mix(other=to_mix, snr=cut_snr, preserve_id=self.preserve_id)
-            # Did the user specify a duration?
-            # If yes, we will ensure that shorter cuts have more noise mixed in
-            # to "pad" them with at the end.
-            # If no, we will mix in as many noise cuts as needed to cover complete
-            # duration.
-            mixed_in_duration = to_mix.duration
-            # Keep sampling until we mixed in a "duration" amount of noise.
-            # Note: we subtract 0.05s (50ms) from the target duration to avoid edge cases
-            #       where we mix in some noise cut that effectively has 0 frames of features.
-            while mixed_in_duration < target_mixed_duration - 0.05:
-                to_mix = next(mix_in_cuts)
-                to_mix = self._maybe_truncate_cut(
-                    to_mix, target_mixed_duration - mixed_in_duration, rng
-                )
-                # Keep the SNR constant for each cut from "self".
-                mixed = mixed.mix(
-                    other=to_mix,
-                    snr=cut_snr,
-                    offset_other_by=mixed_in_duration,
-                    allow_padding=self.allow_padding,
-                    preserve_id=self.preserve_id,
-                )
-                # Since we're adding floats, we can be off by an epsilon and trigger
-                # some assertions for exceeding duration; do precautionary rounding here.
-                mixed_in_duration = round(
-                    mixed_in_duration + to_mix.duration, ndigits=8
-                )
-            # We truncate the mixed to either the original duration or the requested duration.
-            # Note: we don't use 'target_mixed_duration' here because it may have subtracted
-            #       a tiny bit of actual target duration to avoid errors related to edge effects.
-            mixed = mixed.truncate(
-                duration=self.duration if self.duration is not None else cut.duration,
-                preserve_id=self.preserve_id is not None,
+            # Keep the SNR constant for each cut from "self".
+            mixed = mixed.mix(
+                other=to_mix,
+                snr=cut_snr,
+                offset_other_by=mixed_in_duration,
+                allow_padding=self.allow_padding,
+                preserve_id=self.preserve_id,
+                tag=self.tag,
             )
-            yield mixed
+            # Since we're adding floats, we can be off by an epsilon and trigger
+            # some assertions for exceeding duration; do precautionary rounding here.
+            mixed_in_duration = round(mixed_in_duration + to_mix.duration, ndigits=8)
+        # We truncate the mixed to either the original duration or the requested duration.
+        # Note: we don't use 'target_mixed_duration' here because it may have subtracted
+        #       a tiny bit of actual target duration to avoid errors related to edge effects.
+        return mixed.truncate(
+            duration=self.duration if self.duration is not None else cut.duration,
+            preserve_id=self.preserve_id is not None,
+        )
+
+    def __getitem__(self, idx: Any) -> Cut:
+        if not self.has_constant_time_access:
+            raise TypeError(
+                "LazyCutMixer only supports __getitem__ when both the source and "
+                "mix-in cuts provide constant-time indexed access."
+            )
+        graph_token = normalize_graph_token(idx)
+        iteration_seed = (
+            self._iteration_seed
+            if self._iteration_seed is not None
+            else self._resolve_iteration_seed(0)
+        )
+        cut = self.source[graph_token]
+        return attach_graph_origin(
+            self._mix_one(cut, self._make_item_rng(graph_token, iteration_seed)),
+            graph_token,
+        )
+
+    def state_dict(self) -> dict:
+        if not self.is_checkpointable:
+            raise NotImplementedError(
+                "LazyCutMixer checkpointing is only supported when mix_in_cuts "
+                "is indexed (O(1) random-access)."
+            )
+
+        from lhotse.checkpoint import _rng_state_to_json
+
+        rng_state = self._rng.getstate() if self._rng is not None else self._rng_state
+        sd = {
+            "num_times_iterated": self.num_times_iterated,
+            "rng_state": _rng_state_to_json(rng_state)
+            if rng_state is not None
+            else None,
+            "iteration_seed": self._iteration_seed,
+        }
+        source_state = _try_collect_child_state(self.source)
+        if source_state is not None:
+            sd["source"] = source_state
+        return sd
+
+    def load_state_dict(self, sd: dict) -> None:
+        if not self.is_checkpointable:
+            raise NotImplementedError(
+                "LazyCutMixer checkpointing is only supported when mix_in_cuts "
+                "is indexed (O(1) random-access)."
+            )
+
+        from lhotse.checkpoint import _rng_state_from_json
+
+        self.num_times_iterated = sd["num_times_iterated"]
+        if sd.get("rng_state") is not None:
+            self._rng_state = _rng_state_from_json(sd["rng_state"])
+        else:
+            self._rng_state = None
+        self._iteration_seed = sd.get("iteration_seed")
+        _try_restore_child_state(self.source, sd.get("source"))
+        self._restored = True
 
     def _maybe_truncate_cut(
         self, cut: Cut, target_duration: Seconds, rng: random.Random
@@ -3612,7 +4283,7 @@ class LazyCutMixer(Dillable):
         return cut
 
     def __len__(self) -> int:
-        return len(self.source)
+        return len(self._source_len_ref)
 
     def __add__(self, other) -> "LazyIteratorChain":
         return LazyIteratorChain(self, other)

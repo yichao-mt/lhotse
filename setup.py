@@ -58,7 +58,7 @@ IS_DEV_VERSION = not bool(
 )  # False = public release, True = otherwise
 
 
-LHOTSE_REQUIRE_TORCHAUDIO = os.environ.get("LHOTSE_REQUIRE_TORCHAUDIO", "1") in (
+LHOTSE_REQUIRE_TORCHAUDIO = os.environ.get("LHOTSE_REQUIRE_TORCHAUDIO", "0") in (
     "1",
     "True",
     "true",
@@ -157,59 +157,38 @@ install_requires = [
     "packaging",
     "pyyaml>=5.3.1",
     "tabulate>=0.8.1",
+    "torch",
     "tqdm",
 ]
 
-# Workaround for lilcom cmake issue: https://github.com/danpovey/lilcom/issues/41
-# present in automatic documentation builds.
 if os.environ.get("READTHEDOCS", False):
-    install_requires.append("lilcom==1.1.0")
+    lilcom_requires = ["lilcom==1.1.0"]
 else:
-    install_requires.append("lilcom>=1.1.0")
-
-try:
-    # If the user already installed PyTorch, make sure he has torchaudio too.
-    # Otherwise, we'll just install the latest versions from PyPI for the user.
-    import torch
-
-    if LHOTSE_REQUIRE_TORCHAUDIO:
-        try:
-            import torchaudio
-        except ImportError:
-            raise ValueError(
-                "We detected that you have already installed PyTorch, but haven't installed torchaudio. "
-                "Unfortunately we can't detect the compatible torchaudio version for you; "
-                "you will have to install it manually. "
-                "For instructions, please refer either to https://pytorch.org/get-started/locally/ "
-                "or https://github.com/pytorch/audio#dependencies "
-                "You can also disable torchaudio dependency by setting the following environment variable: "
-                "LHOTSE_USE_TORCHAUDIO=0"
-            )
-except ImportError:
-    extras = ["torch"]
-    if LHOTSE_REQUIRE_TORCHAUDIO:
-        extras.append("torchaudio")
-    install_requires.extend(extras)
+    lilcom_requires = ["lilcom>=1.1.0"]
 
 docs_require = (project_root / "docs" / "requirements.txt").read_text().splitlines()
+checkpoint_requires = ["torchdata"]
 tests_require = [
-    "pytest==7.1.3",
-    "pytest-forked==1.4.0",
-    "pytest-xdist==2.5.0",
-    "pytest-cov==4.0.0",
+    "pytest",
+    "pytest-forked",
+    "pytest-xdist",
+    "pytest-cov",
     "flake8==5.0.4",
-    "coverage==6.5.0",
+    "coverage",
     "hypothesis==6.56.0",
     "black==22.3.0",
     "isort==5.10.1",
     "pre-commit>=2.17.0,<=2.19.0",
-]
+] + lilcom_requires
+aistore_requires = ["aistore>=1.17.0"]
 orjson_requires = ["orjson>=3.6.6"]
 webdataset_requires = ["webdataset==0.2.5"]
 dill_requires = ["dill"]
 h5py_requires = ["h5py"]
 kaldi_requires = ["kaldi_native_io", "kaldifeat"]
 workflow_requires = ["scipy"]
+pillow_requires = ["pillow"]
+tests_require = tests_require + checkpoint_requires
 dev_requires = sorted(
     docs_require
     + tests_require
@@ -217,18 +196,16 @@ dev_requires = sorted(
     + webdataset_requires
     + dill_requires
     + workflow_requires
+    + pillow_requires
     + ["jupyterlab", "matplotlib"]
 )
 all_requires = sorted(dev_requires)
 
 if os.environ.get("READTHEDOCS", False):
-    # When building documentation, omit torchaudio installation and mock it instead.
-    # This works around the inability to install libsoundfile1 in read-the-docs env,
-    # which caused the documentation builds to silently crash.
     install_requires = [
         req
         for req in install_requires
-        if not any(req.startswith(dep) for dep in ["torchaudio", "SoundFile"])
+        if not any(req.startswith(dep) for dep in ["SoundFile"])
     ]
 
 setup(
@@ -250,11 +227,15 @@ setup(
     },
     install_requires=install_requires,
     extras_require={
+        "aistore": aistore_requires,
         "dill": dill_requires,
         "orjson": orjson_requires,
         "webdataset": webdataset_requires,
+        "checkpoint": checkpoint_requires,
         "h5py": h5py_requires,
         "kaldi": kaldi_requires,
+        "lilcom": lilcom_requires,
+        "pillow": pillow_requires,
         "docs": docs_require,
         "tests": tests_require,
         "dev": dev_requires,
@@ -267,6 +248,8 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "Intended Audience :: Science/Research",
         "Operating System :: POSIX :: Linux",
         "Operating System :: MacOS :: MacOS X",

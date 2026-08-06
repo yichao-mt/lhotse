@@ -1,9 +1,10 @@
 import random
+import threading
+import time
 import warnings
-from bisect import bisect_right
-from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import islice
+from queue import Queue
 from typing import (
     Any,
     Callable,
@@ -27,12 +28,20 @@ from lhotse.cut import Cut
 from lhotse.dataset.dataloading import resolve_seed
 from lhotse.dataset.sampling.base import (
     CutSampler,
-    EpochDiagnostics,
     SamplingConstraint,
     SamplingDiagnostics,
     TimeConstraint,
 )
+from lhotse.dataset.sampling.checkpoint_backends import (
+    build_dynamic_bucketing_checkpoint_backend,
+)
 from lhotse.dataset.sampling.dynamic import DurationBatcher, Filter, check_constraint
+from lhotse.lazy import (
+    IteratorNode,
+    require_graph_origin,
+    resolve_iterator_source,
+    supports_graph_restore,
+)
 from lhotse.utils import ifnone
 
 
@@ -95,6 +104,7 @@ class DynamicBucketingSampler(CutSampler):
         rank: Optional[int] = None,
         seed: Union[int, Literal["randomized", "trng"]] = 0,
         sync_buckets: bool = True,
+        concurrent: bool = False,
         strict=None,
         shuffle_buffer_size=None,
     ) -> None:
@@ -104,7 +114,7 @@ class DynamicBucketingSampler(CutSampler):
             Note: with multiple CutSets, ``max_duration`` constraint applies only to the first CutSet.
         :param max_cuts: The maximum total number of ``cuts`` per batch.
             When only ``max_duration`` is specified, this sampler yields static batch sizes.
-        :param num_buckets: how many buckets to create.
+        :param num_buckets: how many buckets to create. Ignored if duration_bins are provided.
         :param shuffle: When ``True``, the cuts will be shuffled dynamically with
             a reservoir-sampling-based algorithm.
             Convenient when mini-batch loop is inside an outer epoch-level loop, e.g.:
@@ -131,6 +141,10 @@ class DynamicBucketingSampler(CutSampler):
             when models have quadratic input complexity. Set between 15 and 40 for transformers.
         :param sync_buckets: When set, we'll try to make each DDP rank sample from as close
             duration buckets as possible to minimize the tail worker effect.
+        :param concurrent: Enabling concurrency eliminates most of the waiting to pre-populate the
+            bucketing buffers before the sampler starts yielding examples. For tarred/Lhotse Shar data
+            this can speed up the start of the training. Note that enabling concurrency will cause the
+            sampling results to be non-deterministic. This feature is experimental.
         :param world_size: Total number of distributed nodes. We will try to infer it by default.
         :param rank: Index of distributed node. We will try to infer it by default.
         :param seed: Random seed used to consistently shuffle the dataset across different processes.
@@ -154,6 +168,7 @@ class DynamicBucketingSampler(CutSampler):
         self.buffer_size = buffer_size
         self.quadratic_duration = quadratic_duration
         self.sync_buckets = sync_buckets
+        self.concurrent = concurrent
         self.rng = None
         check_constraint(constraint, max_duration, max_cuts)
 
@@ -169,15 +184,11 @@ class DynamicBucketingSampler(CutSampler):
             self.buffer_size += shuffle_buffer_size
 
         if duration_bins is not None:
-            if num_buckets is not None:
-                assert len(duration_bins) == num_buckets - 1, (
-                    f"num_buckets=={num_buckets} but len(duration_bins)=={len(duration_bins)} "
-                    f"(bins are the boundaries, it should be one less than the number of buckets)."
-                )
             assert list(duration_bins) == sorted(
                 duration_bins
             ), "Duration bins must be sorted ascendingly."
             self.duration_bins = duration_bins
+            self.num_buckets = len(duration_bins) + 1
         else:
             if constraint is None:
                 constraint = TimeConstraint(
@@ -192,9 +203,10 @@ class DynamicBucketingSampler(CutSampler):
             )
 
     def state_dict(self) -> Dict[str, Any]:
-        assert (
-            self.constraint is None
-        ), "state_dict() is not supported with samplers that use a custom constraint."
+        # The custom-constraint object itself is not serialized: constraints are
+        # reconstructed from config on each run. We still capture the iteration
+        # state (rng_state, bucketer_state, epoch, diagnostics) which is what
+        # actually drives exact resume.
         sd = super().state_dict()
         sd.update(
             {
@@ -206,6 +218,40 @@ class DynamicBucketingSampler(CutSampler):
                 "quadratic_duration": self.quadratic_duration,
             }
         )
+        # Capture bucketer state for O(1) indexed restore.
+        # We only save bucketer internals after its iterator loop has started;
+        # before that, buckets are uninitialized and restoring them would
+        # incorrectly look like an exhausted iterator.
+        bucketer = getattr(self, "_bucketer", None)
+        if (
+            bucketer is not None
+            and self.rng is not None
+            and getattr(bucketer, "_selection_state", None) is not None
+        ):
+            try:
+                bucketer_state = bucketer.get_state()
+                sd["rng_state"] = self.rng.getstate()
+                sd["bucketer_state"] = bucketer_state
+            except RuntimeError:
+                # Allow the O(N) replay fallback only when EVERY leaf source in
+                # the cuts graph reports has_constant_time_access=False (i.e. an
+                # all-streaming pipeline that fundamentally cannot do O(1) restore).
+                # If any leaf is graph-restorable, the failure is a wiring bug —
+                # one mixed-in non-restorable source silently disables the O(1)
+                # path for the whole pipeline; raise so the misconfiguration is
+                # visible at checkpoint time rather than degrading to O(N) replay.
+                if any(_leaf_constant_time_flags(self.cuts)):
+                    raise
+            except (AttributeError, TypeError):
+                pass  # Fall back to O(N) on load
+        # If we just restored state and deferred _fast_forward to __iter__,
+        # preserve the pending O(1) payload so state_dict round-trips.
+        if "rng_state" not in sd and "bucketer_state" not in sd:
+            pending_rng_state = getattr(self, "_rng_state", None)
+            pending_bucketer_state = getattr(self, "_bucketer_state", None)
+            if pending_rng_state is not None and pending_bucketer_state is not None:
+                sd["rng_state"] = pending_rng_state
+                sd["bucketer_state"] = pending_bucketer_state
         return sd
 
     def load_state_dict(self, sd: Dict[str, Any]) -> None:
@@ -220,8 +266,13 @@ class DynamicBucketingSampler(CutSampler):
             self.buffer_size += shuffle_buffer_size
         self.quadratic_duration = sd.pop("quadratic_duration", None)
         sd.pop("strict", None)  # backward compatibility
+        # O(1) indexed restore keys (optional, consumed by _fast_forward)
+        self._rng_state = sd.pop("rng_state", None)
+        self._bucketer_state = sd.pop("bucketer_state", None)
         super().load_state_dict(sd)
-        self._fast_forward()
+        # Defer _fast_forward to __iter__ so the sampler remains picklable
+        # for DataLoader with num_workers > 0.
+        self._needs_fast_forward = True
 
     def _fast_forward(self):
         current_epoch = self.diagnostics.current_epoch
@@ -229,18 +280,28 @@ class DynamicBucketingSampler(CutSampler):
 
         # Set the right epoch
         self.set_epoch(current_epoch)
-        # Reset diagnostics for this epoch as we're about to re-iterate
-        self.diagnostics.stats_per_epoch[current_epoch] = EpochDiagnostics(
-            epoch=current_epoch
+        backend = build_dynamic_bucketing_checkpoint_backend(
+            self,
+            current_epoch=current_epoch,
+            num_batches_to_iter=num_batches_to_iter,
         )
+        backend.restore()
 
+    def _initialize_replay_iterator(self) -> None:
+        self._cuts_state = None
+        self._rng_state = None
+        self._bucketer_state = None
         self._just_restored_state = False
         iter(self)
-        for _ in range(num_batches_to_iter):
-            next(self)
-        self._just_restored_state = True
+
+    def _replay_step(self) -> None:
+        next(self)
 
     def __iter__(self) -> "DynamicBucketingSampler":
+        if getattr(self, "_needs_fast_forward", False):
+            self._needs_fast_forward = False
+            self._fast_forward()
+            return self
         if self._just_restored_state:
             return self
         seed = resolve_seed(self.seed)
@@ -263,9 +324,13 @@ class DynamicBucketingSampler(CutSampler):
         # Either we are iterating the epoch for the first time and it's a no-op,
         # or we are iterating the same epoch again, in which case setting more steps
         # than are actually available per epoch would have broken the checkpoint restoration.
-        self.diagnostics.reset_current_epoch()
+        if getattr(self, "_skip_diagnostics_reset_once", False):
+            self._skip_diagnostics_reset_once = False
+        else:
+            self.diagnostics.reset_current_epoch()
         # Initiate iteration
-        cuts_iter = [iter(cs) for cs in self.cuts]
+        restore_sources = [resolve_iterator_source(cs) for cs in self.cuts]
+        cuts_iter = [iter(src) for src in restore_sources]
         # Apply filter predicate
         cuts_iter = Filter(
             iterator=zip(*cuts_iter),
@@ -273,7 +338,7 @@ class DynamicBucketingSampler(CutSampler):
             diagnostics=self.diagnostics,
         )
         # Convert Iterable[Cut] -> Iterable[CutSet]
-        cuts_iter = DynamicBucketer(
+        self._bucketer = DynamicBucketer(
             cuts_iter,
             duration_bins=self.duration_bins,
             world_size=self.world_size,
@@ -286,9 +351,11 @@ class DynamicBucketingSampler(CutSampler):
             shuffle=self.shuffle,
             rng=self.rng,
             bucket_rng=bucket_rng,
+            concurrent=self.concurrent,
             diagnostics=self.diagnostics,
+            restore_sources=restore_sources,
         )
-        self.cuts_iter = iter(cuts_iter)
+        self.cuts_iter = iter(self._bucketer)
         return self
 
     def _next_batch(self) -> Union[CutSet, Tuple[CutSet]]:
@@ -314,6 +381,115 @@ class DynamicBucketingSampler(CutSampler):
     @property
     def num_cuts(self) -> Optional[int]:
         return None
+
+
+@dataclass
+class FixedBucketBatchSizeConstraint(SamplingConstraint):
+    """
+    Sampling constraint that accepts a pre-defined batch size for each bucket.
+    It uses the example's sequence length to determine which bucket we're sampling for,
+    and otherwise the batch size is locally static for each bucket.
+
+    This constraint doesn't support samples longer than the upper bound of the last bucket;
+    if such sample is provided, we will raise an exception.
+    """
+
+    max_seq_len_buckets: List[float]
+    batch_sizes: List[int]
+    current_bucket: Union[int, None] = None
+    num_cuts: int = 0
+
+    def __post_init__(self):
+        assert sorted(self.max_seq_len_buckets) == list(self.max_seq_len_buckets)
+
+    def is_active(self) -> bool:
+        return True
+
+    def add(self, example: Cut) -> None:
+        """
+        Increment the internal counter for the time constraint,
+        selecting the right property from the input ``cut`` object.
+        """
+        seqlen = self.measure_length(example)
+        bucket_idx = self.select_bucket(
+            buckets=self.max_seq_len_buckets, example_len=seqlen
+        )
+        assert bucket_idx < len(self.max_seq_len_buckets), (
+            f"Received example with sequence length {seqlen} that exceeds "
+            f"the highest allowed length {self.max_seq_len_buckets[-1]}."
+        )
+        if self.current_bucket is None:
+            self.current_bucket = bucket_idx
+        else:
+            assert self.current_bucket == bucket_idx, (
+                f"User error: FixedBucketBatchSizeConstraint is supposed to be used only on one bucket. "
+                f"The example we received has sequence length {seqlen} which is outside of the allowed bounds "
+                f"for bucket index {bucket_idx} in buckets {self.max_seq_len_buckets}."
+            )
+        self.num_cuts += 1
+
+    def exceeded(self) -> bool:
+        """Is the constraint exceeded or not."""
+        return self.num_cuts > self.batch_sizes[self.current_bucket]
+
+    def close_to_exceeding(self) -> bool:
+        """
+        Check if the batch is close to satisfying the constraints.
+        We define "closeness" as: if we added one more cut that has
+        duration/num_frames/num_samples equal to the longest seen cut
+        in the current batch, then the batch would have exceeded the constraints.
+        """
+        return self.num_cuts >= self.batch_sizes[self.current_bucket]
+
+    def reset(self) -> None:
+        """
+        Reset the internal counter (to be used after a batch was created,
+        to start collecting a new one).
+        """
+        self.current_bucket = None
+        self.num_cuts = 0
+
+    def measure_length(self, example: Cut) -> float:
+        return example.duration
+
+    def state_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.max_seq_len_buckets = state_dict.pop("max_seq_len_buckets")
+        self.batch_sizes = state_dict.pop("batch_sizes")
+        self.current_bucket = state_dict.pop("current_bucket")
+        self.num_cuts = state_dict.pop("num_cuts")
+        assert len(state_dict) == 0, (
+            "Error in FixedBucketBatchSizeConstraint.load_state_dict(): Unexpected keys:\n- "
+            + "\n- ".join(state_dict.keys())
+        )
+
+    def __add__(
+        self, other: "FixedBucketBatchSizeConstraint"
+    ) -> "FixedBucketBatchSizeConstraint":
+        for key in ("max_seq_len_buckets", "batch_sizes", "current_bucket"):
+            self_attr = getattr(self, key)
+            other_attr = getattr(other, key)
+            is_none = self_attr is None and other_attr is None
+            assert is_none or self_attr == other_attr, (
+                f"To add two TimeConstraint objects, they need to represent the same constraint "
+                f"(got self.{key}={self_attr} != other.{key}={other_attr})."
+            )
+        return FixedBucketBatchSizeConstraint(
+            max_seq_len_buckets=self.max_seq_len_buckets,
+            batch_sizes=self.batch_sizes,
+            current_bucket=self.current_bucket,
+            num_cuts=self.num_cuts + other.num_cuts,
+        )
+
+    def __eq__(self, other: "TimeConstraint") -> bool:
+        return (
+            isinstance(other, FixedBucketBatchSizeConstraint)
+            and self.max_seq_len_buckets == other.max_seq_len_buckets
+            and self.batch_sizes == other.batch_sizes
+            and self.current_bucket == other.current_bucket
+        )
 
 
 def estimate_duration_buckets(
@@ -413,9 +589,12 @@ class DynamicBucketer:
         shuffle: bool = False,
         rng: random.Random = None,
         bucket_rng: random.Random = None,
+        concurrent: bool = False,
         diagnostics: Optional[SamplingDiagnostics] = None,
+        restore_sources: Optional[List[Iterable]] = None,
     ) -> None:
         self.cuts = cuts
+        self.restore_sources = restore_sources
         self.duration_bins = duration_bins
         self.world_size = world_size
         self.max_duration = max_duration
@@ -430,6 +609,7 @@ class DynamicBucketer:
         self.rng = rng
         self.bucket_rng = bucket_rng
         self.shuffle = shuffle
+        self.concurrent = concurrent
 
         assert duration_bins == sorted(duration_bins), (
             f"Argument list for 'duration_bins' is expected to be in "
@@ -458,26 +638,147 @@ class DynamicBucketer:
                 )
 
         # Init: create empty buckets (note: `num_buckets = len(duration_bins) + 1`).
-        self.buckets: List[Deque[Union[Cut, Tuple[Cut, ...]]]] = [
-            deque() for _ in range(len(duration_bins) + 1)
-        ]
+        self.buckets: List[Queue] = [Queue() for _ in range(len(duration_bins) + 1)]
 
-    def __iter__(self) -> Generator[CutSet, None, None]:
-        # Init: sample `buffer_size` cuts and assign them to the right buckets.
-        self.cuts_iter = iter(self.cuts)
-        self._collect_cuts_in_buckets(self.buffer_size)
+        self._producer_thread = None
+        self._source_exhausted = False
+        self._saved_state = None
+        self._selection_state = None
 
-        state = BucketSelectionState(
+    @staticmethod
+    def _supports_graph_restore(source: Any) -> bool:
+        return source is not None and supports_graph_restore(source)
+
+    def _capture_item_token(self, item: Cut, source: Any) -> Any:
+        if not self._supports_graph_restore(source):
+            raise RuntimeError(
+                "DynamicBucketer checkpoint requires graph-restorable sources "
+                "when saving buffered O(1) restore state."
+            )
+        return require_graph_origin(
+            item, "DynamicBucketer checkpoint", "buffered items"
+        )
+
+    def _restore_item_token(self, token: Any, source: Any) -> Cut:
+        if not self._supports_graph_restore(source):
+            raise RuntimeError(
+                "DynamicBucketer checkpoint captured a graph-local restore token, "
+                "but the current iterator graph does not support constant-time "
+                "restoration."
+            )
+        return source[token]
+
+    # ------------------------------------------------------------------
+    # State save / restore for O(1) indexed checkpoint
+    # ------------------------------------------------------------------
+
+    def get_state(self) -> Dict[str, Any]:
+        """Capture bucketer state for checkpoint."""
+        from lhotse.checkpoint import _rng_state_to_json
+
+        bucket_tokens: List[List] = []
+        for bucket in self.buckets:
+            tokens = []
+            with bucket.mutex:
+                for item in bucket.queue:
+                    cuts = item if isinstance(item, tuple) else (item,)
+                    item_tokens = []
+                    for cut_idx, cut in enumerate(cuts):
+                        source = None
+                        if self.restore_sources is not None:
+                            source = self.restore_sources[cut_idx]
+                        item_tokens.append(self._capture_item_token(cut, source))
+                    tokens.append(item_tokens)
+            bucket_tokens.append(tokens)
+
+        state = {
+            "bucket_tokens": bucket_tokens,
+            "rng_state": _rng_state_to_json(self.rng.getstate()),
+        }
+        if self._selection_state is not None:
+            state["selection_state"] = self._selection_state.save()
+        return state
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        """Store state to be consumed at the top of the next __iter__ call."""
+        self._saved_state = state
+
+    def _restore_from_saved_state(self) -> "BucketSelectionState":
+        """
+        Restore bucket contents and RNG from saved state.
+        Returns a BucketSelectionState ready for iteration.
+        """
+        from lhotse.checkpoint import _rng_state_from_json
+
+        state = self._saved_state
+        self._saved_state = None
+
+        # Restore RNG
+        rng_state = _rng_state_from_json(state["rng_state"])
+        self.rng.setstate(rng_state)
+
+        # Restore buffered items from saved graph tokens.
+        bucket_tokens = state["bucket_tokens"]
+        if len(bucket_tokens) != len(self.buckets):
+            raise RuntimeError(
+                "DynamicBucketer checkpoint is inconsistent: "
+                f"saved {len(bucket_tokens)} buckets, expected {len(self.buckets)}."
+            )
+        for bucket, tokens in zip(self.buckets, bucket_tokens):
+            with bucket.mutex:
+                bucket.queue.clear()
+            for item_tokens in tokens:
+                items = []
+                for cut_idx, token in enumerate(item_tokens):
+                    source = None
+                    if self.restore_sources is not None:
+                        source = self.restore_sources[cut_idx]
+                    items.append(self._restore_item_token(token, source))
+                # Match the runtime ingestion format (`zip(*sources)` always
+                # yields tuples, even for the 1-source case), so the queue is
+                # type-uniform across initial fill, refill, and restore.
+                bucket.put(tuple(items))
+
+        # Create and restore BucketSelectionState
+        selection_state = BucketSelectionState(
             bucket_rng=self.bucket_rng,
             num_buckets=len(self.buckets),
             world_size=self.world_size,
         )
+        if "selection_state" in state:
+            selection_state.restore(state["selection_state"])
+        return selection_state
+
+    # ------------------------------------------------------------------
+
+    def __iter__(self) -> Generator[CutSet, None, None]:
+        # Init: sample `buffer_size` cuts and assign them to the right buckets.
+        self.cuts_iter = iter(self.cuts)
+
+        # Check if we need to restore from a saved state (O(1) path)
+        if self._saved_state is not None:
+            state = self._restore_from_saved_state()
+            self._selection_state = state
+        else:
+            if self.concurrent:
+                self._source_exhausted = False
+                self._start_data_producer_thread()
+                self._maybe_wait_for_producer()
+            else:
+                self._collect_cuts_in_buckets(self.buffer_size)
+
+            state = BucketSelectionState(
+                bucket_rng=self.bucket_rng,
+                num_buckets=len(self.buckets),
+                world_size=self.world_size,
+            )
+            self._selection_state = state
 
         # The iteration code starts here.
         # On each step we're sampling a new batch.
         try:
             while True:
-                sampling_bucket = self._select_bucket(state)
+                sampling_bucket = self._select_bucket(self._selection_state)
                 # Apply random shuffling if requested: we'll shuffle the items present within the bucket.
                 maybe_shuffled = sampling_bucket
                 indexes_used = []
@@ -485,6 +786,9 @@ class DynamicBucketer:
                     maybe_shuffled = pick_at_random(
                         maybe_shuffled, rng=self.rng, out_indexes_used=indexes_used
                     )
+                else:
+                    with sampling_bucket.mutex:
+                        maybe_shuffled = list(sampling_bucket.queue)
                 # Sample one batch from that bucket and yield it to the caller.
                 batcher = DurationBatcher(
                     maybe_shuffled,
@@ -496,26 +800,46 @@ class DynamicBucketer:
                     batch_size = len(batch[0])
                 else:
                     batch_size = len(batch)
-                yield batch
-                # Remove sampled cuts from the bucket.
+                # Commit the sampled batch before yielding so checkpoints always
+                # point to the next batch in both main-process and worker-process
+                # iteration.
                 if indexes_used:
-                    # Shuffling, sort indexes of yielded elements largest -> smallest and remove them
                     indexes_used.sort(reverse=True)
-                    for idx in indexes_used:
-                        del sampling_bucket[idx]
+                    with sampling_bucket.mutex:
+                        _q = sampling_bucket.queue
+                        for idx in indexes_used:
+                            del _q[idx]
                 else:
-                    # No shuffling, remove first N
                     for _ in range(batch_size):
-                        sampling_bucket.popleft()
-                # Fetch new cuts and add them to appropriate buckets.
-                self._collect_cuts_in_buckets(batch_size)
+                        sampling_bucket.get()
+                stop_after_yield = False
+                if self.concurrent:
+                    try:
+                        self._maybe_wait_for_producer()
+                    except StopIteration:
+                        stop_after_yield = True
+                else:
+                    try:
+                        self._collect_cuts_in_buckets(batch_size)
+                    except StopIteration:
+                        stop_after_yield = True
+                yield batch
+                if stop_after_yield:
+                    break
         except StopIteration:
             pass
+        finally:
+            # check whether producer thread is still alive and join it before iter ends
+            # in case StopIteration is raised somewhere outside the producer
+            if self.concurrent and self._producer_thread.is_alive():
+                self._source_exhausted = True
+                self._producer_thread.join()
+                self._producer_thread = None
 
-        # Cleanup.
-        self.cuts_iter = None
+            # Cleanup.
+            self.cuts_iter = None
 
-    def _select_bucket(self, state: BucketSelectionState) -> Deque[Cut]:
+    def _select_bucket(self, state: BucketSelectionState) -> Queue:
         if self.bucket_rng is None:
             # Bucket selection algo 1:
             # * there is just one RNG for choosing buckets and choosing samples randomly from the buckets
@@ -543,7 +867,7 @@ class DynamicBucketer:
             #     it will scan the neighbouring buckets until it finds one that's ready
             # * if no bucket is ready, we end iteration
 
-            def scan_buckets(predicate: Callable[[Deque[Cut]], bool]) -> int:
+            def scan_buckets(predicate: Callable[[Queue], bool]) -> int:
                 bucket_idx = state.select_bucket_idx()
 
                 def valid_idx() -> bool:
@@ -586,36 +910,78 @@ class DynamicBucketer:
                 # which may yield partial batches.
                 try:
                     state.restore(ckpt)
-                    selected_bucket_idx = scan_buckets(lambda b: len(b) > 0)
+                    selected_bucket_idx = scan_buckets(lambda b: b.qsize() > 0)
                 except BucketsDontHaveEnoughData:
                     # We exhausted the full dataset.
                     raise StopIteration()
 
             return self.buckets[selected_bucket_idx]
 
-    def _is_ready(self, bucket: Deque[Cut]) -> bool:
+    def _is_ready(self, bucket: Queue) -> bool:
         tot = self.constraint.copy()
-        for c in bucket:
+        with bucket.mutex:
+            contents = list(bucket.queue)
+        for c in contents:
             tot.add(c[0] if isinstance(c, tuple) else c)
             if tot.close_to_exceeding():
                 return True
         return False
 
+    def _start_data_producer_thread(self):
+        """Start concurrent filling of the bucket buffer in a background thread."""
+
+        def producer():
+            try:
+                while not self._source_exhausted:
+                    if sum(b.qsize() for b in self.buckets) == self.buffer_size:
+                        time.sleep(0.1)
+                        continue
+                    cuts = next(self.cuts_iter)
+                    bucket_idx = self.constraint.select_bucket(
+                        buckets=self.duration_bins,
+                        example=cuts[0] if isinstance(cuts, tuple) else cuts,
+                    )
+                    self.buckets[bucket_idx].put(cuts)
+            except StopIteration:
+                self._source_exhausted = True
+
+        # ``daemon=True`` so this background thread does not block process shutdown
+        self._producer_thread = threading.Thread(target=producer, daemon=True)
+        self._producer_thread.start()
+
+    def _maybe_wait_for_producer(self):
+        """Triggers wait for producer if the bucket buffers are less than 10% utilized."""
+        while (
+            sum(b.qsize() for b in self.buckets) < self.buffer_size / 10
+            and not self._source_exhausted
+        ):
+            time.sleep(1.0)
+
     def _collect_cuts_in_buckets(self, n_cuts: int) -> None:
+        """Fetches ``n_cuts`` from the input data iterable. Doesn't use concurrency."""
         try:
             for _ in range(n_cuts):
                 cuts = next(self.cuts_iter)
-                duration = self.constraint.measure_length(
-                    cuts[0] if isinstance(cuts, tuple) else cuts
+                bucket_idx = self.constraint.select_bucket(
+                    buckets=self.duration_bins,
+                    example=cuts[0] if isinstance(cuts, tuple) else cuts,
                 )
-                bucket_idx = bisect_right(self.duration_bins, duration)
-                self.buckets[bucket_idx].append(cuts)
+                self.buckets[bucket_idx].put(cuts)
         except StopIteration:
             pass
 
+    def __del__(self):
+        if (
+            self.concurrent
+            and self._producer_thread is not None
+            and self._producer_thread.is_alive()
+        ):
+            self._source_exhausted = True
+            self._producer_thread.join()
+
 
 def pick_at_random(
-    bucket: Sequence[Union[Cut, Tuple[Cut, ...]]],
+    bucket: Queue,
     rng: random.Random,
     out_indexes_used: list,
 ) -> Generator[Union[Cut, Tuple[Cut, ...]], None, None]:
@@ -623,6 +989,8 @@ def pick_at_random(
     Generator which will yield items in a sequence in a random order.
     It will append the indexes of items yielded during iteration via ``out_used_indexes``.
     """
+    with bucket.mutex:
+        bucket = list(bucket.queue)
     indexes = list(range(len(bucket)))
     rng.shuffle(indexes)
     for idx in indexes:
@@ -644,3 +1012,40 @@ def _emit_shuffle_buffer_size_warning():
         "This argument will be deprecated in a future Lhotse version.",
         category=DeprecationWarning,
     )
+
+
+def _leaf_constant_time_flags(cuts) -> List[bool]:
+    """Walk the iterator graph of ``cuts`` (the sampler's input cutsets) and
+    return one ``has_constant_time_access`` flag per leaf data source.
+
+    A "leaf" is any node with no further ``source`` / ``sources`` to descend
+    into (i.e. the actual data readers — ``LazyNeMoTarredIterator``,
+    ``LazySharIterator``, ``LazyIndexedSharIterator``, ``LazyManifestIterator``,
+    …). Wrapper nodes like ``LazyFilter`` / ``LazyMapper`` / ``LazyShuffler``
+    delegate ``has_constant_time_access`` to their child, so they're not
+    informative — recurse through them.
+    """
+    flags: List[bool] = []
+
+    def _walk(node):
+        # Unwrap CutSet (and similar manifest wrappers) to its underlying iterator.
+        if hasattr(node, "data") and not callable(getattr(node, "data")):
+            node = node.data
+        children = None
+        if isinstance(node, IteratorNode):
+            srcs = getattr(node, "sources", None)
+            if isinstance(srcs, (list, tuple)) and srcs:
+                children = list(srcs)
+            else:
+                src = getattr(node, "source", None)
+                if src is not None and not callable(src):
+                    children = [src]
+        if children:
+            for c in children:
+                _walk(c)
+        else:
+            flags.append(bool(getattr(node, "has_constant_time_access", False)))
+
+    for cs in cuts:
+        _walk(cs)
+    return flags

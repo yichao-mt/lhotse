@@ -12,15 +12,32 @@ from .audio import (
     set_current_audio_backend,
     set_ffmpeg_torchaudio_info_enabled,
 )
+from .audio.resampling_backend import (
+    available_resampling_backends,
+    get_current_resampling_backend,
+    resampling_backend,
+    set_current_resampling_backend,
+)
 from .caching import is_caching_enabled, set_caching_enabled
 from .cut import CutSet, MonoCut, MultiCut, create_cut_set_eager, create_cut_set_lazy
 from .features import *
+from .image import Image
 from .kaldi import load_kaldi_data_dir
 from .lazy import dill_enabled, is_dill_enabled, set_dill_enabled
 from .manipulation import combine, split_parallelize_combine, to_manifest
 from .qa import fix_manifests, validate, validate_recordings_and_supervisions
-from .serialization import load_manifest, load_manifest_lazy, store_manifest
+from .serialization import (
+    available_io_backends,
+    get_current_io_backend,
+    get_default_io_backend,
+    io_backend,
+    load_manifest,
+    load_manifest_lazy,
+    set_current_io_backend,
+    store_manifest,
+)
 from .supervision import SupervisionSegment, SupervisionSet
+from .tools.env import add_macos_homebrew_lib_paths as _add_macos_homebrew_lib_paths
 from .tools.env import add_tools_to_path as _add_tools_to_path
 from .utils import (
     Decibels,
@@ -53,6 +70,7 @@ except:
     else:
         __version__ = f"0.0.0+unknown.version"
 
-from . import augmentation, dataset, features, recipes
+from . import ais, augmentation, dataset, features, recipes
 
 _add_tools_to_path()
+_add_macos_homebrew_lib_paths()

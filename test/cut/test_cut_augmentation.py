@@ -7,9 +7,14 @@ import torch
 
 from lhotse import AudioSource, CutSet, MonoCut, Recording, SupervisionSegment
 from lhotse.audio import RecordingSet
-from lhotse.cut import PaddingCut
+from lhotse.cut import Cut, MixedCut, PaddingCut
 from lhotse.testing.dummies import dummy_cut, dummy_multi_cut
-from lhotse.utils import fastcopy, is_module_available, nullcontext
+from lhotse.utils import (
+    fastcopy,
+    is_module_available,
+    is_torchaudio_available,
+    nullcontext,
+)
 
 
 @pytest.fixture
@@ -424,6 +429,27 @@ def test_mixed_cut_start01_reverb_rir_mix_first(cut_with_supervision_start01, ri
     )
 
 
+def test_mixed_cut_start01_reverb_rir_mix_first_deserialized(
+    cut_with_supervision_start01, rir
+):
+    mixed_rvb_orig = cut_with_supervision_start01.pad(duration=0.5).reverb_rir(
+        rir_recording=rir, mix_first=True
+    )
+    mixed_rvb = MixedCut.from_dict(mixed_rvb_orig.to_dict())
+    assert mixed_rvb.start == 0  # MixedCut always starts at 0
+    assert mixed_rvb.duration == 0.5
+    assert mixed_rvb.end == 0.5
+    assert mixed_rvb.num_samples == 4000
+
+    # Check that the padding part should not be all zeros afte
+    np.testing.assert_raises(
+        AssertionError,
+        np.testing.assert_array_almost_equal,
+        mixed_rvb.load_audio()[:, 3200:],
+        np.zeros((1, 800)),
+    )
+
+
 def test_mixed_cut_start01_reverb_rir_with_fast_random(
     cut_with_supervision_start01, rir
 ):
@@ -496,6 +522,24 @@ def test_mixed_cut_normalize_loudness(cut_with_supervision_start01, target, mix_
     loudness = meter.integrated_loudness(mixed_cut_ln.load_audio().T)
     if mix_first:
         assert loudness == pytest.approx(target, abs=0.5)
+
+
+@pytest.mark.skipif(
+    not is_module_available("pyloudnorm"),
+    reason="This test requires pyloudnorm to be installed.",
+)
+def test_mixed_cut_normalize_loudness_deserialized(cut_with_supervision_start01):
+    target = -15.0
+    mixed_cut = cut_with_supervision_start01.append(cut_with_supervision_start01)
+    mixed_cut_ln_orig = mixed_cut.normalize_loudness(target, mix_first=True)
+    mixed_cut_ln = MixedCut.from_dict(mixed_cut_ln_orig.to_dict())
+
+    import pyloudnorm as pyln
+
+    # check if loudness is correct
+    meter = pyln.Meter(mixed_cut_ln.sampling_rate)  # create BS.1770 meter
+    loudness = meter.integrated_loudness(mixed_cut_ln.load_audio().T)
+    assert loudness == pytest.approx(target, abs=0.5)
 
 
 @pytest.mark.skipif(
@@ -734,6 +778,7 @@ def test_cut_reverb_rir_assert_sampling_rate(libri_cut_with_supervision, rir):
         _ = cut.load_audio()
 
 
+@pytest.mark.skipif(not is_torchaudio_available(), reason="Requires torchaudio")
 def test_cut_reverb_fast_rir(libri_cut_with_supervision):
     cut = libri_cut_with_supervision
     cut_rvb = cut.reverb_rir(rir_recording=None)
@@ -862,3 +907,35 @@ def test_cut_set_reverb_rir(libri_cut_set, rir, affix_id):
         assert original.sampling_rate == perturbed_rvb.sampling_rate
         assert original.num_samples == perturbed_rvb.num_samples
         assert original.load_audio().shape == perturbed_rvb.load_audio().shape
+
+
+@pytest.fixture
+def mixed_cut_with_supervision(cut_with_supervision):
+    return cut_with_supervision.append(cut_with_supervision)
+
+
+@pytest.mark.parametrize("codec", ["opus", "mp3", "vorbis"])
+@pytest.mark.parametrize("compression_level", [0.01, 0.5, 0.99])
+@pytest.mark.parametrize("cut_type", ["mono", "mixed"])
+def test_cut_compress(
+    cut_with_supervision, mixed_cut_with_supervision, codec, compression_level, cut_type
+):
+    cut = mixed_cut_with_supervision if cut_type == "mixed" else cut_with_supervision
+    cut_cp = cut.compress(codec=codec, compression_level=compression_level)
+
+    assert cut.id == cut_cp.id
+    assert cut.sampling_rate == cut_cp.sampling_rate
+    assert cut.num_samples == cut_cp.num_samples
+    assert cut.load_audio().shape == cut_cp.load_audio().shape
+
+
+@pytest.mark.parametrize("cut_type", ["mono", "mixed"])
+def test_compress_invalid_params(
+    cut_with_supervision, mixed_cut_with_supervision, cut_type
+):
+    cut = mixed_cut_with_supervision if cut_type == "mixed" else cut_with_supervision
+    with pytest.raises(ValueError):
+        cut.compress(codec="invalid", compression_level=0.5)
+
+    with pytest.raises(ValueError):
+        cut.compress(codec="mp3", compression_level=1.5)

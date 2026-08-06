@@ -15,7 +15,7 @@ from typing import (
 from lhotse.cut import Cut
 from lhotse.dataset.dataloading import resolve_seed
 from lhotse.lazy import (
-    Dillable,
+    IteratorNode,
     LazyIteratorChain,
     LazyJsonlIterator,
     LazyManifestIterator,
@@ -26,7 +26,41 @@ from lhotse.shar.readers.tar import TarIterator
 from lhotse.utils import Pathlike, exactly_one_not_null, ifnone
 
 
-class LazySharIterator(Dillable):
+def _is_local_uncompressed(path) -> bool:
+    """True if *path* is a local, uncompressed file (not pipe/URL/gz)."""
+    p = str(path)
+    if p.startswith("pipe:") or "://" in p:
+        return False
+    return not extension_contains(".gz", p)
+
+
+def _discover_fields(in_dir: Path) -> Tuple[set, dict]:
+    """Discover shard fields from an ``in_dir``.
+
+    Returns ``(fields, streams)`` where *fields* is a set of non-cuts
+    field names and *streams* maps each field (plus ``"cuts"``) to a
+    sorted list of shard paths.
+
+    Index files (``.idx``) are excluded from discovery.
+    """
+    all_paths = [p for p in in_dir.glob("*") if p.suffix != ".idx"]
+    fields = set(p.stem.split(".")[0] for p in all_paths)
+    assert "cuts" in fields, f"No cuts JSONL shards found in {in_dir}"
+    fields.remove("cuts")
+
+    streams: Dict[str, list] = {
+        "cuts": sorted(
+            p
+            for p in all_paths
+            if p.name.split(".")[0] == "cuts" and extension_contains(".jsonl", p)
+        )
+    }
+    for field in fields:
+        streams[field] = sorted(p for p in all_paths if p.name.split(".")[0] == field)
+    return fields, streams
+
+
+class LazySharIterator(IteratorNode):
     """
     LazySharIterator reads cuts and their corresponding data from multiple shards,
     also recognized as the Lhotse Shar format.
@@ -126,7 +160,7 @@ class LazySharIterator(Dillable):
         ``trng`` mode is mostly useful when the user has limited control over the training loop
         and may not be able to guarantee internal Shar epoch is being incremented, but needs
         randomness on each iteration (e.g. useful with PyTorch Lightning).
-    :param stateful_shuffle: bool, by default ``False``. When ``True``, every
+    :param stateful_shuffle: bool, by default ``True``. When ``True``, every
         time this object is fully iterated, it increments an internal epoch counter
         and triggers shard reshuffling with RNG seeded by ``seed`` + ``epoch``.
         Doesn't have any effect when ``shuffle_shards`` is ``False``.
@@ -134,9 +168,15 @@ class LazySharIterator(Dillable):
         It's expected to have the same length as the number of shards, so each function
         corresponds to a specific shard.
         It can be used to attach shard-specific custom attributes to cuts.
+    :param slice_length: optional int, when set enables random slicing of shards that
+        may improve sampling randomness for many-dataset-with-many-large-shards setups
+        at the cost of efficiency. In this mode, we randomly select K to skip first K examples
+        and read only ``slice_length`` examples from each shard, then move to the next one.
 
     See also: :class:`~lhotse.shar.writers.shar.SharWriter`
     """
+
+    is_checkpointable = True
 
     def __init__(
         self,
@@ -147,25 +187,28 @@ class LazySharIterator(Dillable):
         stateful_shuffle: bool = True,
         seed: Union[int, Literal["randomized"], Literal["trng"]] = 42,
         cut_map_fns: Optional[Sequence[Callable[[Cut], Cut]]] = None,
+        slice_length: Optional[int] = None,
     ) -> None:
         assert exactly_one_not_null(
             fields, in_dir
         ), "To read Lhotse Shar format, provide either 'in_dir' or 'fields' argument."
         if split_for_dataloading:
-            assert seed != "randomized", (
-                "Error: seed='randomized' and split_for_dataloading=True are mutually exclusive options "
-                "as they would result in data loss."
+            assert seed not in ("randomized", "trng"), (
+                "Error: setting seed to 'randomized' or 'trng' and using split_for_dataloading=True "
+                "are mutually exclusive options as they would result in data loss."
             )
 
         self.split_for_dataloading = split_for_dataloading
         self.shuffle_shards = shuffle_shards
         self.stateful_shuffle = stateful_shuffle
         self.seed = seed
+        self.slice_length = slice_length
         self.epoch = 0
 
         self._len = None
         if in_dir is not None:
-            self._init_from_dir(in_dir)
+            self.in_dir = Path(in_dir)
+            self.fields, self.streams = _discover_fields(self.in_dir)
         else:
             self._init_from_inputs(fields)
 
@@ -181,6 +224,7 @@ class LazySharIterator(Dillable):
         ]
 
         self.cut_map_fns = ifnone(cut_map_fns, [None] * self.num_shards)
+        self._restored = False
 
     def _init_from_inputs(self, fields: Optional[Dict[str, Sequence[str]]] = None):
         assert (
@@ -190,25 +234,10 @@ class LazySharIterator(Dillable):
         self.fields.remove("cuts")
         self.streams = fields
 
-    def _init_from_dir(self, in_dir: Pathlike):
-        self.in_dir = Path(in_dir)
-
-        all_paths = list(self.in_dir.glob("*"))
-        self.fields = set(p.stem.split(".")[0] for p in all_paths)
-        assert "cuts" in self.fields
-        self.fields.remove("cuts")
-
-        self.streams = {
-            "cuts": sorted(
-                p
-                for p in all_paths
-                if p.name.split(".")[0] == "cuts" and extension_contains(".jsonl", p)
-            )
-        }
-        for field in self.fields:
-            self.streams[field] = sorted(
-                p for p in all_paths if p.name.split(".")[0] == field
-            )
+    @property
+    def is_indexed(self) -> bool:
+        """Always ``False`` — ``LazySharIterator`` is the streaming reader."""
+        return False
 
     def _maybe_split_for_dataloading(self, shards: List) -> List:
         from .utils import split_by_node, split_by_worker
@@ -218,30 +247,55 @@ class LazySharIterator(Dillable):
         else:
             return shards
 
+    def _get_rng(self) -> random.Random:
+        seed = resolve_seed(self.seed)
+        if self.stateful_shuffle:
+            seed += self.epoch
+        return random.Random(seed)
+
     def _maybe_shuffle_shards(self, shards: List) -> List:
         if self.shuffle_shards:
             shards = shards.copy()
-
-            seed = resolve_seed(self.seed)
-
-            if self.stateful_shuffle:
-                seed += self.epoch
-
-            random.Random(seed).shuffle(shards)
+            self._get_rng().shuffle(shards)
         return shards
 
     def __iter__(self):
-        shards, map_fns = self.shards, self.cut_map_fns
-        shards = self._maybe_shuffle_shards(shards)
-        shards = self._maybe_split_for_dataloading(shards)
-        if map_fns is not None:
-            # The functions also need to be shuffled/split, if present.
-            map_fns = self._maybe_shuffle_shards(map_fns)
-            map_fns = self._maybe_split_for_dataloading(map_fns)
+        restored = self._restored
+        self._restored = False
 
-        for shard, cut_map_fn in zip(shards, map_fns):
+        shards = self.shards
+        map_fns = self.cut_map_fns
+        rng = self._get_rng()
+
+        if restored:
+            # Use the saved shard order and resume positions.
+            shard_order = self._shard_order
+            start_shard = self._current_shard_idx
+            skip_in_shard = self._position_in_shard
+        else:
+            # Normal path: shuffle/split indices into self.shards.
+            indices = list(range(len(shards)))
+            indices = self._maybe_shuffle_shards(indices)
+            indices = self._maybe_split_for_dataloading(indices)
+            shard_order = indices
+            start_shard = 0
+            skip_in_shard = 0
+
+        self._shard_order = shard_order
+
+        for i in range(start_shard, len(shard_order)):
+            orig_idx = shard_order[i]
+            shard = shards[orig_idx]
+            cut_map_fn = map_fns[orig_idx] if map_fns is not None else None
+
+            self._current_shard_idx = i
+            self._position_in_shard = 0
+
             # Iterate over cuts for the current shard
             cuts = LazyManifestIterator(shard["cuts"])
+            if self.slice_length is not None:
+                # Sampling a slicing offset requires to know the length
+                cuts = list(cuts)
 
             # Iterate over tarfiles/jsonl containing data for specific fields of each cut
             field_paths = {
@@ -257,7 +311,25 @@ class LazySharIterator(Dillable):
             }
 
             # *field_data contains all fields for a single cut (recording, features, array, etc.)
-            for cut, *field_data in zip(cuts, *field_iters.values()):
+            yielded_cntr = 0
+            slice_offset = (
+                rng.randint(0, len(cuts) - self.slice_length)
+                if self.slice_length is not None and self.slice_length < len(cuts)
+                else -1
+            )
+            for idx, (cut, *field_data) in enumerate(zip(cuts, *field_iters.values())):
+                if idx < slice_offset:
+                    continue
+                elif yielded_cntr == self.slice_length:
+                    break
+
+                # Skip already-consumed items when restoring
+                if i == start_shard and yielded_cntr < skip_in_shard:
+                    yielded_cntr += 1
+                    self._position_in_shard = yielded_cntr
+                    continue
+
+                # Filling shar placeholders with actual data from tar files etc.
                 for (field, (maybe_manifest, data_path)) in zip(
                     field_iters.keys(),
                     field_data,
@@ -266,16 +338,33 @@ class LazySharIterator(Dillable):
                         continue  # No value available for the current field for this cut.
                     assert (
                         str(data_path.parent / data_path.stem) == cut.id
-                    ), f"Mismatched IDs: cut ID is '{cut.id}' but found data with name '{data_path}' fsor field {field}"
+                    ), f"Mismatched IDs: cut ID is '{cut.id}' but found data with name '{data_path}' for field {field}"
                     setattr(cut, field, maybe_manifest)
 
                 cut.shard_origin = shard["cuts"]
                 cut.shar_epoch = self.epoch
                 if cut_map_fn is not None:
                     cut = cut_map_fn(cut)
+                yielded_cntr += 1
+                self._position_in_shard = yielded_cntr
                 yield cut
 
         self.epoch += 1
+
+    def state_dict(self) -> dict:
+        return {
+            "epoch": self.epoch,
+            "current_shard_idx": getattr(self, "_current_shard_idx", 0),
+            "position_in_shard": getattr(self, "_position_in_shard", 0),
+            "shard_order": getattr(self, "_shard_order", None),
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.epoch = sd["epoch"]
+        self._current_shard_idx = sd["current_shard_idx"]
+        self._position_in_shard = sd["position_in_shard"]
+        self._shard_order = sd["shard_order"]
+        self._restored = True
 
     def __len__(self) -> int:
         if self._len is None:

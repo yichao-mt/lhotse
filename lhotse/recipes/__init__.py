@@ -14,6 +14,7 @@ from .but_reverb_db import download_but_reverb_db, prepare_but_reverb_db
 from .bvcc import download_bvcc, prepare_bvcc
 from .callhome_egyptian import prepare_callhome_egyptian
 from .callhome_english import prepare_callhome_english
+from .cdsd import prepare_cdsd
 from .chime6 import download_chime6, prepare_chime6
 from .cmu_arctic import download_cmu_arctic, prepare_cmu_arctic
 from .cmu_indic import download_cmu_indic, prepare_cmu_indic
@@ -26,13 +27,16 @@ from .dihard3 import prepare_dihard3
 from .dipco import download_dipco, prepare_dipco
 from .earnings21 import download_earnings21, prepare_earnings21
 from .earnings22 import download_earnings22, prepare_earnings22
+from .ears import download_ears, prepare_ears
 from .edacc import download_edacc, prepare_edacc
 from .eval2000 import prepare_eval2000
 from .fisher_english import prepare_fisher_english
 from .fisher_spanish import prepare_fisher_spanish
+from .fleurs import download_fleurs, prepare_fleurs
 from .gale_arabic import prepare_gale_arabic
 from .gale_mandarin import prepare_gale_mandarin
 from .gigaspeech import prepare_gigaspeech
+from .gigaspeech2 import prepare_gigaspeech2
 from .gigast import download_gigast, prepare_gigast
 from .grid import download_grid, prepare_grid
 from .heroico import download_heroico, prepare_heroico
@@ -47,7 +51,9 @@ from .l2_arctic import prepare_l2_arctic
 from .libricss import download_libricss, prepare_libricss
 from .librilight import prepare_librilight
 from .librimix import download_librimix, prepare_librimix
+from .librimix_mini import download_librimix_mini, prepare_librimix_mini
 from .librispeech import download_librispeech, prepare_librispeech
+from .librispeechmix import download_librispeechmix, prepare_librispeechmix
 from .libritts import (
     download_libritts,
     download_librittsr,
@@ -64,10 +70,17 @@ from .mobvoihotwords import download_mobvoihotwords, prepare_mobvoihotwords
 from .mtedx import download_mtedx, prepare_mtedx
 from .musan import download_musan, prepare_musan
 from .nsc import prepare_nsc
+from .oto_speech import download_oto_speech, prepare_oto_speech
 from .peoples_speech import prepare_peoples_speech
+from .radio import prepare_radio
 from .reazonspeech import download_reazonspeech, prepare_reazonspeech
 from .rir_noise import download_rir_noise, prepare_rir_noise
+from .sbcsae import download_sbcsae, prepare_sbcsae
 from .slu import prepare_slu
+from .spatial_librispeech import (
+    download_spatial_librispeech,
+    prepare_spatial_librispeech,
+)
 from .speechcommands import download_speechcommands, prepare_speechcommands
 from .speechio import prepare_speechio
 from .spgispeech import download_spgispeech, prepare_spgispeech
@@ -84,6 +97,8 @@ from .voxceleb import download_voxceleb1, download_voxceleb2, prepare_voxceleb
 from .voxconverse import download_voxconverse, prepare_voxconverse
 from .voxpopuli import download_voxpopuli, prepare_voxpopuli
 from .wenet_speech import prepare_wenet_speech
+from .wenetspeech4tts import prepare_wenetspeech4tts
+from .wham import download_wham, prepare_wham
 from .xbmu_amdo31 import download_xbmu_amdo31, prepare_xbmu_amdo31
 from .yesno import download_yesno, prepare_yesno
 
@@ -131,14 +146,19 @@ __all__ = [
     "prepare_earnings21",
     "download_earnings22",
     "prepare_earnings22",
+    "download_ears",
+    "prepare_ears",
     "download_edacc",
     "prepare_edacc",
     "prepare_eval2000",
     "prepare_fisher_english",
     "prepare_fisher_spanish",
+    "download_fleurs",
+    "prepare_fleurs",
     "prepare_gale_arabic",
     "prepare_gale_mandarin",
     "prepare_gigaspeech",
+    "prepare_gigaspeech2",
     "download_gigast",
     "prepare_gigast",
     "download_grid",
@@ -161,6 +181,8 @@ __all__ = [
     "prepare_librilight",
     "download_librimix",
     "prepare_librimix",
+    "download_librimix_mini",
+    "prepare_librimix_mini",
     "download_librispeech",
     "prepare_librispeech",
     "download_libritts",
@@ -185,6 +207,7 @@ __all__ = [
     "prepare_peoples_speech",
     "download_reazonspeech",
     "prepare_reazonspeech",
+    "prepare_radio",
     "download_rir_noise",
     "prepare_rir_noise",
     "prepare_slu",
@@ -215,6 +238,8 @@ __all__ = [
     "download_voxpopuli",
     "prepare_voxpopuli",
     "prepare_wenet_speech",
+    "download_wham",
+    "prepare_wham",
     "download_xbmu_amdo31",
     "prepare_xbmu_amdo31",
     "download_yesno",

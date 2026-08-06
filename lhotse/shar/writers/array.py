@@ -1,15 +1,15 @@
 import codecs
 import json
 from io import BytesIO
-from typing import List, Literal, Optional, Union
+from typing import Callable, List, Literal, Optional, Union
 
-import lilcom
 import numpy as np
 
 from lhotse import Features
 from lhotse.array import Array, TemporalArray
 from lhotse.shar.utils import to_shar_placeholder
 from lhotse.shar.writers.tar import TarWriter
+from lhotse.utils import is_module_available
 
 
 class ArrayTarWriter:
@@ -27,6 +27,7 @@ class ArrayTarWriter:
         ...     w.write("fbank2", fbank2_array)  # etc.
 
     It would create files such as ``some_dir/fbank.000000.tar``, ``some_dir/fbank.000001.tar``, etc.
+    The starting shard offset can be set using ``shard_offset`` parameter. The writer starts from 0 by default.
 
     It's also possible to use ``ArrayTarWriter`` with automatic sharding disabled::
 
@@ -43,9 +44,21 @@ class ArrayTarWriter:
         shard_size: Optional[int] = 1000,
         compression: Literal["numpy", "lilcom"] = "numpy",
         lilcom_tick_power: int = -5,
+        shard_offset: int = 0,
+        on_shard_complete: Optional[Callable[[str], None]] = None,
     ):
+        if compression == "lilcom" and not is_module_available("lilcom"):
+            raise ImportError(
+                "ArrayTarWriter with lilcom compression requires the 'lilcom' module. "
+                "Install it or use compression='numpy'."
+            )
         self.compression = compression
-        self.tar_writer = TarWriter(pattern, shard_size)
+        self.tar_writer = TarWriter(
+            pattern,
+            shard_size,
+            shard_offset=shard_offset,
+            on_shard_complete=on_shard_complete,
+        )
         self.lilcom_tick_power = lilcom_tick_power
 
     def __enter__(self):
@@ -78,6 +91,8 @@ class ArrayTarWriter:
             assert np.issubdtype(
                 value.dtype, np.floating
             ), "Lilcom compression supports only floating-point arrays."
+            import lilcom
+
             data = lilcom.compress(value, tick_power=self.lilcom_tick_power)
             stream = BytesIO(data)
             ext = ".llc"
